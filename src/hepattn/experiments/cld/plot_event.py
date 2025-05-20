@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import torch
 
 
 def plot_cld_event_reconstruction(inputs, reconstruction, axes_spec):
@@ -12,8 +13,7 @@ def plot_cld_event_reconstruction(inputs, reconstruction, axes_spec):
     colormap = plt.cm.tab10
     cycler = [colormap(i) for i in range(colormap.N)]
 
-    batch_idx = 0
-    num_particles = reconstruction["particle_valid"].sum()
+    batch_idx = torch.argmax(reconstruction["particle_valid"].sum(-1))
 
     sihit_names = ["vtb", "vte", "itb", "ite", "otb", "ote", "sihit"]
 
@@ -36,21 +36,33 @@ def plot_cld_event_reconstruction(inputs, reconstruction, axes_spec):
 
             ax[ax_idx].scatter(x, y, alpha=0.25, s=1.0, color="black")
 
-            for mcparticle_idx in range(num_particles):
+            mask = reconstruction[f"particle_{input_name}_valid"][batch_idx]
+
+            for mcparticle_idx in range(mask.shape[-2]):
                 color = cycler[mcparticle_idx % len(cycler)]
                 mask = reconstruction[f"particle_{input_name}_valid"][batch_idx][mcparticle_idx]
 
                 # Tracker hit
                 if input_name in sihit_names:
-                    ax[ax_idx].plot(x[mask], y[mask], color=color, marker="o", alpha=0.75, linewidth=1.0, ms=2.0)
+                    # Used for sorting the hits in time when we want to plot them in order in the tracker
+                    idx = torch.argsort(inputs[f"{input_name}_time"][batch_idx][mask], dim=-1)
 
-                # Calo hit
-                elif input_name in ecal_names or input_name in hcal_names:
-                    ax[ax_idx].scatter(x[mask], y[mask], color=color, marker="s", alpha=0.5, s=2.0)
+                    ax[ax_idx].plot(x[mask][idx], y[mask][idx], color=color, marker="o", alpha=0.75, linewidth=1.0, ms=2.0)
+
+                    # if len(x[mask]) > 0:
+                    #    ax[ax_idx].text(x[mask][idx][-1], y[mask][idx][-1], str(reconstruction["particle_sihit_max_abs_deta"][batch_idx][mcparticle_idx].item()), fontsize=6)
+
+                # ECAL hit
+                elif input_name in ecal_names:
+                    ax[ax_idx].scatter(x[mask], y[mask], color=color, marker=".", alpha=0.5, s=1.0)
+
+                # HCAL hit
+                elif input_name in hcal_names:
+                    ax[ax_idx].scatter(x[mask], y[mask], color=color, marker="s", alpha=0.5, s=4.0)
 
                 # Muon hit
                 elif input_name == "muon":
-                    ax[ax_idx].scatter(x[mask], y[mask], color=color, marker="+", alpha=0.75, s=4.0)
+                    ax[ax_idx].scatter(x[mask], y[mask], color=color, marker="x", alpha=0.75, s=4.0)
 
                 ax[ax_idx].set_xlabel(ax_spec["x"])
                 ax[ax_idx].set_ylabel(ax_spec["y"])

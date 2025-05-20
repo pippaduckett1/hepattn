@@ -1,6 +1,10 @@
+from typing import Literal
+
 import torch
 from lightning import LightningModule
+from lion_pytorch import Lion
 from torch import nn
+from torch.optim import AdamW
 from torchjd import mtl_backward
 from torchjd.aggregation import UPGrad
 
@@ -11,7 +15,7 @@ class ModelWrapper(LightningModule):
         name: str,
         model: nn.Module,
         lrs_config: dict,
-        optimizer: str = "AdamW",
+        optimizer: Literal["AdamW", "Lion"] = "AdamW",
         mtl: bool = False,
     ):
         super().__init__()
@@ -66,7 +70,7 @@ class ModelWrapper(LightningModule):
         # First log any task metrics
         self.log_task_metrics(preds, targets, stage)
 
-        # log custom metrics implemented by subclass
+        # Log any custom metrics implemented by subclass
         if hasattr(self, "log_custom_metrics"):
             self.log_custom_metrics(preds, targets, stage)
 
@@ -129,23 +133,21 @@ class ModelWrapper(LightningModule):
                     param_group["lr"] = self.lrs_config["initial"]
 
     def configure_optimizers(self):
-        # Pick which optimizer we want to use
         if self.optimizer.lower() == "adamw":
-            from torch.optim import AdamW  # noqa: PLC0415
-
-            opt = AdamW(self.model.parameters(), lr=self.lrs_config["initial"], weight_decay=self.lrs_config["weight_decay"])
-        # https://arxiv.org/abs/2302.06675
+            optimizer = AdamW
         elif self.optimizer.lower() == "lion":
-            from lion_pytorch import Lion  # noqa: PLC0415
+            optimizer = Lion
+        else:
+            raise ValueError(f"Unknown optimizer: {self.opt_config['opt']}")
 
-            opt = Lion(self.model.parameters(), lr=self.lrs_config["initial"], weight_decay=self.lrs_config["weight_decay"])
+        opt = optimizer(self.model.parameters(), lr=self.lrs_config["initial"], weight_decay=self.lrs_config["weight_decay"])
 
         if not self.lrs_config["skip_scheduler"]:
             # Configure the learning rate scheduler
             sch = torch.optim.lr_scheduler.OneCycleLR(
                 opt,
                 max_lr=self.lrs_config["max"],
-                total_steps=self.trainer.estimated_stepping_batches * 2,
+                total_steps=self.trainer.estimated_stepping_batches,
                 div_factor=self.lrs_config["max"] / self.lrs_config["initial"],
                 final_div_factor=self.lrs_config["initial"] / self.lrs_config["end"],
                 pct_start=float(self.lrs_config["pct_start"]),
@@ -161,15 +163,17 @@ class ModelWrapper(LightningModule):
 
         for layer_name, layer_losses in losses.items():
             # Get a list of the features that are used by all of the tasks
-            layer_features = []
+            layer_feature_names = set()
             for task in self.model.tasks:
-                layer_features.extend(outputs[layer_name][input_feature] for input_feature in task.input_features)
+                layer_feature_names.update(task.inputs)
 
             # Remove any duplicate features that are used by multiple tasks
-            layer_features = list(set(layer_features))
+            layer_features = [outputs[layer_name][feature_name] for feature_name in layer_feature_names]
 
             # Perform the backward pass for this layer
-            layer_losses = [sum(losses[layer_name][task.name]) for task in self.model.tasks]
+            # For each layer we sum the losses from each task, so we get one loss per task
+            layer_losses = [sum(losses[layer_name][task.name].values()) for task in self.model.tasks]
+
             mtl_backward(losses=layer_losses, features=layer_features, aggregator=UPGrad())
 
         opt.step()
