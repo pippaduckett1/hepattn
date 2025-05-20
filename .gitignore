@@ -8,5 +8,6 @@
 *.png
 *.pdf
 *.out
+data/*
 
 logs/
