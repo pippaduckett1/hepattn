@@ -6,6 +6,7 @@ from torch import Tensor, nn
 
 from hepattn.models.dense import Dense
 from hepattn.models.loss import cost_fns, focal_loss, loss_fns
+from hepattn.utils.scaling import RegressionTargetScaler
 
 
 class Task(nn.Module, ABC):
@@ -277,3 +278,157 @@ class ObjectHitMaskTask(Task):
             loss = loss_fns[loss_fn](output, target, mask=object_hit_mask, weight=weight)
             losses[loss_fn] = loss_weight * loss
         return losses
+
+
+class RegressionTask(Task):
+    def __init__(self, name: str, target_labels: list[str], input_object: str, output_object: str, dim: int, scaler: RegressionTargetScaler, losses: dict[str, float], add_momentum: bool = False, **kwargs):
+        """Regression task without uncertainty prediction.
+
+        Parameters
+        ----------
+        name : str
+            Name of the task
+        targets : list
+            List of target names
+        input_object : str
+            Name of the input object
+        output_object : str
+            Name of the output object
+        scaler : RegressionTargetScaler
+            Target scaler object
+        add_momentum : bool
+            Whether to add scalar momentum to the predictions, computed from the px, py, pz predictions
+        """
+        super().__init__(**kwargs)
+        self.name = name
+        self.input_object = input_object
+        self.output_object = output_object
+        self.target_labels = target_labels
+        self.scaler = scaler
+        self.losses = losses
+        self.add_momentum = add_momentum
+        self.net = Dense(dim, len(target_labels))
+        if self.add_momentum:
+            assert all([t in self.target_labels for t in ["px", "py", "pz"]])
+            self.target_labels.append("p")
+            self.i_px = self.target_labels.index("px")
+            self.i_py = self.target_labels.index("py")
+            self.i_pz = self.target_labels.index("pz")
+
+    def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Compute regression loss between predictions and targets.
+        
+        Parameters
+        ----------
+        outputs : dict[str, Tensor]
+            Dictionary containing model outputs. The predictions should be in
+            scaled space and have shape [batch_size, num_preds, num_features].
+        targets : dict[str, Tensor]
+            Dictionary containing target values. The targets will be scaled
+            inside this function and should have shape [batch_size, num_targets].
+            
+        Returns
+        -------
+        dict[str, dict[str, Tensor]]
+            Nested dictionary structure:
+            - First level keys are loss function names (e.g. 'smoothl1')
+            - Second level contains per-feature losses (e.g. 'px_loss') and 'total'
+            - Values are scalar tensors
+        """
+        reg_preds = outputs[self.name]  # [batch, num_preds, num_features]
+
+        # Build labels tensor by scaling and concatenating targets
+        label_tensors: list[Tensor] = []
+        for tgt in self.target_labels:
+            scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
+            label_tensors.append(scaled_tgt.unsqueeze(-1))
+        labels = torch.cat(label_tensors, dim=-1)  # [batch, num_targets, num_features]
+
+        # Get valid indices - exclude any target that is all NaN or all zero
+        valid_idx = targets[f"{self.output_object}_valid"]
+        valid_idx &= ~torch.isnan(labels).all(-1)
+        valid_idx &= ~(labels == 0).all(-1)
+        #TODO if use hits need to add a mask here
+        # valid_idx = torch.logical_and(valid_idx, label_masks[self.name])
+
+        # Initialize nested loss dictionary
+        loss_dict: dict[str, Tensor] = {}
+
+        # Calculate losses per loss function
+        for loss_fn, loss_weight in self.losses.items():
+            # Get the loss function from the registry
+            loss_fn_callable = loss_fns[loss_fn]
+            # Calculate per-feature losses with appropriate reduction
+            feature_losses = loss_fn_callable(
+                reg_preds[valid_idx],  # [valid_batch, num_features]
+                labels[valid_idx],     # [valid_batch, num_features]
+            )
+            # Store total loss for this loss function
+            # TODO: could weight different features differently
+            loss_dict[loss_fn] = loss_weight * feature_losses.mean()
+
+        return loss_dict
+
+    def cost(self, outputs, targets):
+        
+        # Detach predictions and get the relevant predictions
+        preds = outputs[self.name].detach()
+        
+        # Build labels array just like in loss function
+        labels = []
+        for tgt in self.target_labels:
+            scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
+            labels.append(scaled_tgt.unsqueeze(-1))
+        labels = torch.cat(labels, dim=-1)
+
+        # Get valid indices
+        valid_idx = targets[f"{self.output_object}_valid"]
+        valid_idx &= ~torch.isnan(labels).all(-1)
+        valid_idx &= ~(labels == 0).all(-1)
+
+        # Initialize cost dictionary
+        cost_dict = {}
+        for cost_fn, cost_weight in self.costs.items():
+            cost_dict[cost_fn] = cost_weight * cost_fns[cost_fn](preds, labels)
+
+        #TODO check if this is correct
+        # Expand valid_idx to match [batch, pred, true]
+        mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1)  
+        cost_dict[self.name][~mask] = 1e6
+        
+        return cost_dict
+
+    def forward(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
+        # get the predictions
+        preds = self.net(x[self.input_object + "_embed"]).squeeze(-1)
+        if self.add_momentum:
+            preds = self.add_momentum_to_preds(preds)
+        #TODO when pred do I do I need to unscale?
+        return {self.name: preds}
+
+    def add_momentum_to_preds(self, preds: Tensor):
+        momentum = torch.sqrt(preds[..., self.i_px] ** 2 + preds[..., self.i_py] ** 2 + preds[..., self.i_pz] ** 2)
+        preds = torch.cat([preds, momentum.unsqueeze(-1)], dim=-1)
+        return preds
+
+    def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        """Convert raw model outputs to unscaled predictions for evaluation.
+        
+        This method unscales the predictions since it's used for evaluation and logging,
+        not for loss calculation. The loss and cost functions work with scaled values.
+        
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary mapping each target name to its unscaled predicted values
+            in the original target space.
+        """
+        preds = outputs[self.name]  # [batch, num_preds, num_features]
+        
+        # Unscale each feature
+        unscaled_preds = {}
+        for i, tgt in enumerate(self.target_labels):
+            # All features including momentum need unscaling
+            unscaled_preds[f"{self.output_object}_{tgt}"] = self.scaler.inverse(tgt)(preds[..., i])
+            #TODO check unscaling especially pT
+        return unscaled_preds

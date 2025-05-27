@@ -16,6 +16,18 @@ def object_ce_costs(pred_logits, true):
     )
     return losses
 
+def smoothl1_loss(pred_logits, true, mask=None, weight=None):  # noqa: ARG001
+    # TODO: Add support for mask?
+    losses = torch.nn.SmoothL1Loss(pred_logits, true, weight=weight, reduction="none")
+    return losses.mean()
+
+def smoothl1_costs(pred_logits, true):
+    # TODO: Add support for mask?
+    losses = torch.nn.SmoothL1Loss(pred_logits.unsqueeze(2).expand(-1, -1, true.shape[1], -1),
+                                   true.unsqueeze(1).expand(-1, pred_logits.shape[1], -1, -1),
+                                   reduction="none")
+    return losses.mean()
+
 
 def mask_dice_loss(pred_logits, true, mask=None, weight=None):
     pred = pred_logits.sigmoid()
@@ -92,6 +104,7 @@ cost_fns = {
     "mask_ce": mask_ce_costs,
     "mask_dice": mask_dice_costs,
     "mask_focal": mask_focal_costs,
+    "smoothl1": smoothl1_costs,
 }
 
-loss_fns = {"object_ce": object_ce_loss, "mask_ce": mask_ce_loss, "mask_dice": mask_dice_loss, "mask_focal": focal_loss}
+loss_fns = {"object_ce": object_ce_loss, "mask_ce": mask_ce_loss, "mask_dice": mask_dice_loss, "mask_focal": focal_loss, "smoothl1": smoothl1_loss}

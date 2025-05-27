@@ -133,6 +133,7 @@ class MaskFormer(nn.Module):
                     # We only want to mask an attention slot if every task agrees the slots should be masked
                     # so we only mask if both the existing and new attention mask are masked, which means a slot is valid if
                     # either current or new mask is valid
+                    #TODO is it worth experimenting with this?
                     if input_name in attn_masks:
                         attn_masks[input_name] |= attn_mask
                     else:
