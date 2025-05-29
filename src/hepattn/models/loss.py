@@ -18,15 +18,19 @@ def object_ce_costs(pred_logits, true):
 
 def smoothl1_loss(pred_logits, true, mask=None, weight=None):  # noqa: ARG001
     # TODO: Add support for mask?
-    losses = torch.nn.SmoothL1Loss(pred_logits, true, weight=weight, reduction="none")
+    losses = F.smooth_l1_loss(pred_logits, true, reduction="none")
+    if weight is not None:
+        losses = losses * weight
     return losses.mean()
 
 def smoothl1_costs(pred_logits, true):
-    # TODO: Add support for mask?
-    losses = torch.nn.SmoothL1Loss(pred_logits.unsqueeze(2).expand(-1, -1, true.shape[1], -1),
-                                   true.unsqueeze(1).expand(-1, pred_logits.shape[1], -1, -1),
-                                   reduction="none")
-    return losses.mean()
+    # Expand dimensions to compute pairwise costs between predictions and targets
+    pred_expanded = pred_logits.unsqueeze(2).expand(-1, -1, true.shape[1], -1)
+    true_expanded = true.unsqueeze(1).expand(-1, pred_logits.shape[1], -1, -1)
+    # Compute pairwise smooth L1 losses
+    losses = F.smooth_l1_loss(pred_expanded, true_expanded, reduction="none")
+    # Sum over the feature dimension to get a single cost per pred-target pair
+    return losses.sum(-1)
 
 
 def mask_dice_loss(pred_logits, true, mask=None, weight=None):

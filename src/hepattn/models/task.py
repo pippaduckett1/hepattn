@@ -281,7 +281,19 @@ class ObjectHitMaskTask(Task):
 
 
 class RegressionTask(Task):
-    def __init__(self, name: str, target_labels: list[str], input_object: str, output_object: str, dim: int, scaler: RegressionTargetScaler, losses: dict[str, float], add_momentum: bool = False, **kwargs):
+    def __init__(
+        self, 
+        name: str, 
+        target_labels: list[str], 
+        input_object: str, 
+        output_object: str, 
+        scaler: RegressionTargetScaler, 
+        losses: dict[str, float],
+        costs: dict[str, float],
+        net: nn.Module | None = None,
+        add_momentum: bool = False, 
+        **kwargs
+    ):   
         """Regression task without uncertainty prediction.
 
         Parameters
@@ -296,6 +308,8 @@ class RegressionTask(Task):
             Name of the output object
         scaler : RegressionTargetScaler
             Target scaler object
+        net : nn.Module | None
+            Neural network module to use. Must not be None.
         add_momentum : bool
             Whether to add scalar momentum to the predictions, computed from the px, py, pz predictions
         """
@@ -306,8 +320,14 @@ class RegressionTask(Task):
         self.target_labels = target_labels
         self.scaler = scaler
         self.losses = losses
+        self.costs = costs
         self.add_momentum = add_momentum
-        self.net = Dense(dim, len(target_labels))
+        if net is None:
+            raise ValueError("net parameter must not be None")
+        self.net = net
+        self.outputs = [self.name]
+
+
         if self.add_momentum:
             assert all([t in self.target_labels for t in ["px", "py", "pz"]])
             self.target_labels.append("p")
@@ -346,8 +366,8 @@ class RegressionTask(Task):
 
         # Get valid indices - exclude any target that is all NaN or all zero
         valid_idx = targets[f"{self.output_object}_valid"]
-        valid_idx &= ~torch.isnan(labels).all(-1)
-        valid_idx &= ~(labels == 0).all(-1)
+        valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
+        valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
         #TODO if use hits need to add a mask here
         # valid_idx = torch.logical_and(valid_idx, label_masks[self.name])
 
@@ -381,20 +401,32 @@ class RegressionTask(Task):
             labels.append(scaled_tgt.unsqueeze(-1))
         labels = torch.cat(labels, dim=-1)
 
-        # Get valid indices
-        valid_idx = targets[f"{self.output_object}_valid"]
-        valid_idx &= ~torch.isnan(labels).all(-1)
-        valid_idx &= ~(labels == 0).all(-1)
+        # Get valid indices - create a new tensor instead of modifying in place
+        valid_idx = targets[f"{self.output_object}_valid"].clone()
+        valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
+        valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
 
         # Initialize cost dictionary
         cost_dict = {}
-        for cost_fn, cost_weight in self.costs.items():
-            cost_dict[cost_fn] = cost_weight * cost_fns[cost_fn](preds, labels)
 
-        #TODO check if this is correct
-        # Expand valid_idx to match [batch, pred, true]
-        mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1)  
-        cost_dict[self.name][~mask] = 1e6
+        for cost_fn, cost_weight in self.costs.items():
+            # Calculate the base costs between all pred-target pairs
+            base_costs = cost_weight * cost_fns[cost_fn](preds, labels)
+            # Create mask for invalid targets
+            # Create mask for invalid targets - create new tensor
+            mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1).clone()
+            # Create a new tensor for costs with masked values set to 1e6
+            costs = torch.where(
+                mask,
+                base_costs,
+                torch.full_like(base_costs, 1e6)
+            )
+            cost_dict[cost_fn] = costs
+
+        # #TODO check if this is correct
+        # # Expand valid_idx to match [batch, pred, true]
+        # mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1)  
+        # cost_dict[self.name][~mask] = 1e6
         
         return cost_dict
 
