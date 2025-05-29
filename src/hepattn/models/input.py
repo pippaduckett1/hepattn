@@ -1,12 +1,14 @@
 import torch
 from torch import Tensor, nn
 
-
 def concat_tensors(tensors: list[Tensor]) -> Tensor:
     x = []
 
     for tensor in tensors:
-        if tensor.ndim == 2:
+        if hasattr(tensor, '_nested'):  # Check if tensor is a nested tensor
+            # Handle nested tensor case
+            tensor = tensor.to_padded_tensor(padding=0.0)
+        elif tensor.ndim == 2:
             tensor = tensor.unsqueeze(-1)
         x.append(tensor)
 

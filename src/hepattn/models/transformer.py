@@ -236,6 +236,8 @@ class Encoder(nn.Module):
         if self.attn_type == "flash" and self.window_wrap:
             x = torch.cat([x[:, -self.window_size // 2 :], x, x[:, : self.window_size // 2]], dim=1)
 
+        if self.attn_type not in ["torch", "flash-varlen"]:
+            kwargs.pop("kv_mask", None)
         # Apply layers
         initial_values = {} if self.value_residual else None
         for layer in self.layers:
