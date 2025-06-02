@@ -54,6 +54,11 @@ class TrackMLDataset(Dataset):
         self.num_events = num_events
         self.event_names = event_names[:num_events]
 
+        # Sample ID is an integer that can uniquely identify each event/sample, used for picking out events during eval etc
+        self.sample_ids = np.array([int(name.split("event")[-1]) for name in self.event_names], dtype=np.int64)
+        self.sample_ids_to_event_names = {self.sample_ids[i]: str(self.event_names[i]) for i in range(len(self.sample_ids))}
+        self.event_names_to_sample_ids = {v: k for k, v in self.sample_ids_to_event_names.items()}
+
         # Setup hit eval file if specified
         if self.hit_eval_path:
             print(f"Using hit eval dataset {self.hit_eval_path}")
@@ -78,6 +83,7 @@ class TrackMLDataset(Dataset):
 
         # Load the event
         hits, particles = self.load_event(idx)
+        event_name = self.event_names[idx]
 
         num_particles = len(particles)
 
@@ -118,6 +124,8 @@ class TrackMLDataset(Dataset):
                 x = torch.full((self.event_max_num_particles,), torch.nan)
                 x[:num_particles] = torch.from_numpy(particles[field].to_numpy()[: self.event_max_num_particles])
                 targets[f"particle_{field}"] = x.unsqueeze(0)
+
+        targets["sample_id"] = event_name
 
         return inputs, targets
 
@@ -171,9 +179,16 @@ class TrackMLDataset(Dataset):
         # If a hit eval file was specified, read in the predictions from it to use the hit filtering
         if self.hit_eval_path:
             with h5py.File(self.hit_eval_path, "r") as hit_eval_file:
-                # The dataset has shape (1, num_hits)
-                hit_filter_pred = hit_eval_file[f"{event_name}/preds/final/hit_filter/hit_on_valid_particle"][0]
-                hits = hits[hit_filter_pred]
+                try:
+                    hit_filter_pred = hit_eval_file[f"{event_name}/preds/final/hit_filter/hit_on_valid_particle"][0]
+                    hits = hits[hit_filter_pred]
+                except:
+                    print(f"event name: {event_name}")
+                    print(hit_eval_file[f"{event_name}"])
+                    print(hit_eval_file[f"{event_name}/preds"])   
+                    print(hit_eval_file[f"{event_name}/preds/final"]) 
+                    print(hit_eval_file[f"{event_name}/preds/final/hit_filter"])
+                    print(hit_eval_file[f"{event_name}/preds/final/hit_filter/hit_on_valid_particle"])
 
         # TODO: Add back truth based hit filtering
 

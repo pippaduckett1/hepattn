@@ -54,10 +54,13 @@ class PredictionWriter(Callback):
 
         # Get all of the sample IDs in the batch, this is what will be used to retrieve the samples
         sample_ids = targets["sample_id"]
+        if isinstance(sample_ids, str):
+            sample_ids = [sample_ids]
 
         # Iterate through all of the samples in the batch
         for idx in range(len(sample_ids)):
-            sample_id = str(sample_ids[idx].item())
+            sample_id_val = sample_ids[idx]
+            sample_id = sample_id_val if isinstance(sample_id_val, str) else str(sample_id_val.item())
             sample_group = self.file.create_group(sample_id)
 
             # Write inputs and targets
@@ -98,7 +101,11 @@ class PredictionWriter(Callback):
             for task_name, task_items in layer_items.items():
                 task_group = layer_group.create_group(task_name)
                 for name, value in task_items.items():
-                    self.create_dataset(task_group, name, value[idx][None, ...])
+                    if len(value.shape) == 1:
+                        val = value[idx][None, ...]  # Original behavior for shape (N,)
+                    else:
+                        val =  value
+                    self.create_dataset(task_group, name, val)
 
     def on_test_epoch_end(self, trainer, module):
         # Close the file handle now we are done
