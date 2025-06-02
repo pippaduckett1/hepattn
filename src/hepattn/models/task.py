@@ -14,8 +14,21 @@ class Task(nn.Module, ABC):
         super().__init__()
 
     @abstractmethod
-    def forward(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Compute the forward pass of the task."""
+    def forward(self, x: dict[str, Tensor], track_hit_valid_mask: dict[str, Tensor] | None = None, track_valid_mask: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+        """Compute the forward pass of the task.
+        
+        Parameters
+        ----------
+        x : dict[str, Tensor]
+            Dictionary containing the base input tensors.
+        additional_inputs : dict[str, Tensor] | None, optional
+            Optional dictionary containing additional input tensors.
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary containing the task outputs.
+        """
 
     @abstractmethod
     def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
@@ -300,14 +313,18 @@ class RegressionTask(Task):
         ----------
         name : str
             Name of the task
-        targets : list
-            List of target names
+        target_labels : list[str]
+            List of target names to predict
         input_object : str
             Name of the input object
         output_object : str
             Name of the output object
         scaler : RegressionTargetScaler
-            Target scaler object
+            Target scaler object for scaling/unscaling predictions
+        losses : dict[str, float]
+            Dictionary mapping loss function names to their weights
+        costs : dict[str, float]
+            Dictionary mapping cost function names to their weights
         net : nn.Module | None
             Neural network module to use. Must not be None.
         add_momentum : bool
@@ -350,41 +367,51 @@ class RegressionTask(Task):
         Returns
         -------
         dict[str, dict[str, Tensor]]
-            Nested dictionary structure:
-            - First level keys are loss function names (e.g. 'smoothl1')
-            - Second level contains per-feature losses (e.g. 'px_loss') and 'total'
-            - Values are scalar tensors
+            Dictionary mapping loss function names to dictionaries containing:
+            - Per-feature losses with keys like 'px_loss', 'py_loss', etc.
+            - 'total': weighted sum of all feature losses
         """
         reg_preds = outputs[self.name]  # [batch, num_preds, num_features]
 
         # Build labels tensor by scaling and concatenating targets
         label_tensors: list[Tensor] = []
         for tgt in self.target_labels:
-            scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
-            label_tensors.append(scaled_tgt.unsqueeze(-1))
+            try:
+                target_key = f"{self.output_object}_{tgt}"
+                if target_key not in targets:
+                    raise KeyError(f"Missing target {target_key}")
+                scaled_tgt = self.scaler.scale(tgt)(targets[target_key])
+                label_tensors.append(scaled_tgt.unsqueeze(-1))
+            except Exception as e:
+                raise RuntimeError(f"Error processing target {tgt}: {str(e)}")
+                
         labels = torch.cat(label_tensors, dim=-1)  # [batch, num_targets, num_features]
 
         # Get valid indices - exclude any target that is all NaN or all zero
-        valid_idx = targets[f"{self.output_object}_valid"]
+        valid_key = f"{self.output_object}_valid"
+        if valid_key not in targets:
+            raise KeyError(f"Missing validity mask {valid_key}")
+            
+        valid_idx = targets[valid_key]
         valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
         valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
-        #TODO if use hits need to add a mask here
-        # valid_idx = torch.logical_and(valid_idx, label_masks[self.name])
 
         # Initialize nested loss dictionary
-        loss_dict: dict[str, Tensor] = {}
+        loss_dict: dict[str, dict[str, Tensor]] = {}
 
         # Calculate losses per loss function
         for loss_fn, loss_weight in self.losses.items():
             # Get the loss function from the registry
+            if loss_fn not in loss_fns:
+                raise ValueError(f"Unknown loss function {loss_fn}")
+                
             loss_fn_callable = loss_fns[loss_fn]
+
             # Calculate per-feature losses with appropriate reduction
             feature_losses = loss_fn_callable(
                 reg_preds[valid_idx],  # [valid_batch, num_features]
                 labels[valid_idx],     # [valid_batch, num_features]
             )
-            # Store total loss for this loss function
-            # TODO: could weight different features differently
             loss_dict[loss_fn] = loss_weight * feature_losses.mean()
 
         return loss_dict
@@ -431,11 +458,37 @@ class RegressionTask(Task):
         return cost_dict
 
     def forward(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
-        # get the predictions
-        preds = self.net(x[self.input_object + "_embed"]).squeeze(-1)
+        """Forward pass for regression predictions.
+        
+        Parameters
+        ----------
+        x : dict[str, Tensor]
+            Dictionary containing input tensors. Must contain key f"{input_object}_embed"
+            with shape [batch_size, num_queries, embedding_dim].
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary containing predictions with key self.name and shape
+            [batch_size, num_queries, num_features], where num_features is
+            len(target_labels).
+        """
+        input_embed = x[self.input_object + "_embed"]
+        # Check input dimensions
+        assert input_embed.dim() == 3, f"Expected 3D input tensor, got shape {input_embed.shape}"
+        
+        # Get predictions from network
+        preds = self.net(input_embed)
+        
+        # Ensure predictions have expected shape
+        expected_features = len(self.target_labels) - (1 if self.add_momentum else 0)
+        assert preds.shape[-1] == expected_features, \
+            f"Expected {expected_features} output features but got {preds.shape[-1]}"
+        
+        # Add momentum if requested
         if self.add_momentum:
             preds = self.add_momentum_to_preds(preds)
-        #TODO when pred do I do I need to unscale?
+            
         return {self.name: preds}
 
     def add_momentum_to_preds(self, preds: Tensor):
@@ -449,18 +502,349 @@ class RegressionTask(Task):
         This method unscales the predictions since it's used for evaluation and logging,
         not for loss calculation. The loss and cost functions work with scaled values.
         
+        Parameters
+        ----------
+        outputs : dict[str, Tensor]
+            Dictionary containing model outputs with shape [batch_size, num_preds, num_features]
+            
         Returns
         -------
         dict[str, Tensor]
             Dictionary mapping each target name to its unscaled predicted values
-            in the original target space.
+            in the original target space. Each tensor has shape [batch_size, num_preds].
         """
+        if self.name not in outputs:
+            raise KeyError(f"Missing predictions for task {self.name}")
+            
         preds = outputs[self.name]  # [batch, num_preds, num_features]
+        
+        if preds.shape[-1] != len(self.target_labels):
+            raise ValueError(
+                f"Expected predictions with {len(self.target_labels)} features, "
+                f"got {preds.shape[-1]}"
+            )
         
         # Unscale each feature
         unscaled_preds = {}
         for i, tgt in enumerate(self.target_labels):
-            # All features including momentum need unscaling
-            unscaled_preds[f"{self.output_object}_{tgt}"] = self.scaler.inverse(tgt)(preds[..., i])
-            #TODO check unscaling especially pT
+            try:
+                # All features including momentum need unscaling
+                unscaled_preds[f"{self.output_object}_{tgt}"] = self.scaler.inverse(tgt)(preds[..., i])
+            except Exception as e:
+                raise RuntimeError(f"Error unscaling feature {tgt}: {str(e)}")
+                
+        return unscaled_preds
+    
+
+
+
+class FPRegressionTask(Task):
+    def __init__(
+        self, 
+        name: str, 
+        target_labels: list[str], 
+        input_object: str, 
+        add_embed: str | None,
+        output_object: str, 
+        scaler: RegressionTargetScaler, 
+        losses: dict[str, float],
+        costs: dict[str, float],
+        hit_input_vars: list[str],
+        max_hits: int,
+        net: nn.Module | None = None,
+        add_momentum: bool = False, 
+        **kwargs
+    ):   
+        """Regression task without uncertainty prediction.
+
+        Parameters
+        ----------
+        name : str
+            Name of the task
+        target_labels : list[str]
+            List of target names to predict
+        input_object : str
+            Name of the input object
+        output_object : str
+            Name of the output object
+        scaler : RegressionTargetScaler
+            Target scaler object for scaling/unscaling predictions
+        losses : dict[str, float]
+            Dictionary mapping loss function names to their weights
+        costs : dict[str, float]
+            Dictionary mapping cost function names to their weights
+        net : nn.Module | None
+            Neural network module to use. Must not be None.
+        add_momentum : bool
+            Whether to add scalar momentum to the predictions, computed from the px, py, pz predictions
+        """
+        super().__init__(**kwargs)
+        self.name = name
+        self.input_object = input_object
+        self.output_object = output_object
+        self.target_labels = target_labels
+        self.scaler = scaler
+        self.losses = losses
+        self.costs = costs
+        self.add_embed = add_embed
+        self.add_momentum = add_momentum
+        self.hit_input_vars = hit_input_vars
+        self.max_hits = max_hits
+        
+        # Network to process query embeddings
+        if net is None:
+            raise ValueError("net parameter must not be None")
+        self.net = net
+        
+        # Output dimension for predictions
+        self.output_dim = len(self.target_labels) + (1 if self.add_momentum else 0)
+        
+        self.outputs = [self.name]
+
+        if self.add_momentum:
+            assert all([t in self.target_labels for t in ["px", "py", "pz"]]), "px, py, pz required for momentum calculation"
+            self.target_labels.append("p")
+            self.i_px = self.target_labels.index("px")
+            self.i_py = self.target_labels.index("py")
+            self.i_pz = self.target_labels.index("pz")
+
+    def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Compute regression loss between predictions and targets.
+        
+        Parameters
+        ----------
+        outputs : dict[str, Tensor]
+            Dictionary containing model outputs. The predictions should be in
+            scaled space and have shape [batch_size, num_preds, num_features].
+        targets : dict[str, Tensor]
+            Dictionary containing target values. The targets will be scaled
+            inside this function and should have shape [batch_size, num_targets].
+            
+        Returns
+        -------
+        dict[str, dict[str, Tensor]]
+            Dictionary mapping loss function names to dictionaries containing:
+            - Per-feature losses with keys like 'px_loss', 'py_loss', etc.
+            - 'total': weighted sum of all feature losses
+        """
+        reg_preds = outputs[self.name]  # [batch, num_preds, num_features]
+
+        # Build labels tensor by scaling and concatenating targets
+        label_tensors: list[Tensor] = []
+        for tgt in self.target_labels:
+            try:
+                target_key = f"{self.output_object}_{tgt}"
+                if target_key not in targets:
+                    raise KeyError(f"Missing target {target_key}")
+                scaled_tgt = self.scaler.scale(tgt)(targets[target_key])
+                label_tensors.append(scaled_tgt.unsqueeze(-1))
+            except Exception as e:
+                raise RuntimeError(f"Error processing target {tgt}: {str(e)}")
+                
+        labels = torch.cat(label_tensors, dim=-1)  # [batch, num_targets, num_features]
+
+        # Get valid indices - exclude any target that is all NaN or all zero
+        valid_key = f"{self.output_object}_valid"
+        if valid_key not in targets:
+            raise KeyError(f"Missing validity mask {valid_key}")
+            
+        valid_idx = targets[valid_key]
+        valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
+        valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
+
+        # Initialize nested loss dictionary
+        loss_dict: dict[str, dict[str, Tensor]] = {}
+
+        # Calculate losses per loss function
+        for loss_fn, loss_weight in self.losses.items():
+            # Get the loss function from the registry
+            if loss_fn not in loss_fns:
+                raise ValueError(f"Unknown loss function {loss_fn}")
+                
+            loss_fn_callable = loss_fns[loss_fn]
+            
+            # Skip calculation if no valid samples
+            if not valid_idx.any():
+                feature_losses = torch.zeros(len(self.target_labels), device=reg_preds.device)
+            else:
+                # Calculate per-feature losses with appropriate reduction
+                feature_losses = loss_fn_callable(
+                    reg_preds[valid_idx],  # [valid_batch, num_features]
+                    labels[valid_idx],     # [valid_batch, num_features]
+                )
+            
+            # # Store per-feature losses
+            # for i, tgt in enumerate(self.target_labels):
+            #     loss_dict[loss_fn][f"{tgt}_loss"] = loss_weight * feature_losses[i]
+                
+            # Store total loss
+            loss_dict[loss_fn] = loss_weight * feature_losses.mean()
+
+        return loss_dict
+
+    def cost(self, outputs, targets):
+        
+        # Detach predictions and get the relevant predictions
+        preds = outputs[self.name].detach()
+        
+        # Build labels array just like in loss function
+        labels = []
+        for tgt in self.target_labels:
+            scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
+            labels.append(scaled_tgt.unsqueeze(-1))
+        labels = torch.cat(labels, dim=-1)
+
+        # Get valid indices - create a new tensor instead of modifying in place
+        valid_idx = targets[f"{self.output_object}_valid"].clone()
+        valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
+        valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
+
+        # Initialize cost dictionary
+        cost_dict = {}
+
+        for cost_fn, cost_weight in self.costs.items():
+            # Calculate the base costs between all pred-target pairs
+            base_costs = cost_weight * cost_fns[cost_fn](preds, labels)
+            # Create mask for invalid targets
+            # Create mask for invalid targets - create new tensor
+            mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1).clone()
+            # Create a new tensor for costs with masked values set to 1e6
+            costs = torch.where(
+                mask,
+                base_costs,
+                torch.full_like(base_costs, 1e6)
+            )
+            cost_dict[cost_fn] = costs
+
+        # #TODO check if this is correct
+        # # Expand valid_idx to match [batch, pred, true]
+        # mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1)  
+        # cost_dict[self.name][~mask] = 1e6
+        
+        return cost_dict
+
+    def forward(self, x: dict[str, Tensor], track_hit_valid_mask: dict[str, Tensor] | None = None, track_valid_mask: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+        """Forward pass for regression predictions.
+        
+        Parameters
+        ----------
+        x : dict[str, Tensor]
+            Dictionary containing input tensors. Must contain key f"{input_object}_embed"
+            with shape [batch_size, num_queries, embedding_dim].
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary containing predictions with key self.name and shape
+            [batch_size, num_queries, num_features], where num_features is
+            len(target_labels).
+        """
+        input_embed = x["query_embed"]
+        # hit_valid_mask = track_valid_mask["hit_valid"]
+        #TODO only 6 hits?
+
+        # want tensor of shape [batch, num_queries, 3*max_num_hits]
+        # where max_num_hits is the max number of hits per track
+        # and the tensor is filled with the coords of the hits that are assigned to the tracks
+        # and padded with zeros for the rest
+        # if no track hit assignment mask is provided, then throw error
+
+        input_coords = x["hit_coords"]  # [batch, hits, 3]
+        
+        # Get track-hit assignments, error if not provided
+        if track_hit_valid_mask is None:
+            raise ValueError("track_hit_valid_mask is required")
+        track_hit_assignment = track_hit_valid_mask["track_hit_valid"]  # [batch, num_queries, num_hits]
+
+        # Get hit coordinates
+        track_hit_coords = get_hit_coords(track_hit_assignment, input_coords)
+
+        def get_hit_coords(track_hit_assignment, input_coords):
+            # Count number of hits per track
+            # extract hits for tracks from valid mask then extract the coords
+            # find max num hits and pad up to this
+            # for those hits so that final input is [batch, valid_query, 3*max_num_hits]
+            num_hits_per_track = track_hit_assignment.sum(dim=-1)  # [batch, num_queries]
+
+            
+            # Initialize output tensor
+            batch_size, num_queries, num_input_hit_vars = track_hit_assignment.shape
+            track_hit_coords = torch.zeros(batch_size, num_queries, self.max_hits * num_input_hit_vars, device=input_coords.device)
+            
+            # For each track that has hits assigned, gather and flatten its hit coordinates
+            for b in range(batch_size):
+                for q in range(num_queries):
+                    if num_hits_per_track[b, q] > 0:
+                        # Get indices of assigned hits
+                        hit_indices = torch.where(track_hit_assignment[b, q])[0]
+                        # Gather coordinates for those hits and flatten
+                        track_hits = input_coords[b, hit_indices]  # [num_hits, 3]
+                        #TODO do I need to add padding here?
+                        
+                        track_hit_coords[b, q, :int(num_hits_per_track[b, q] * 3)] = track_hits.flatten()
+
+            return track_hit_coords
+            
+            # Now track_hit_coords has shape [batch, num_queries, max_hits*3]
+            # with coordinates of assigned hits, padded with zeros
+
+        # Check input dimensions
+        assert input_embed.dim() == 3, f"Expected 3D input tensor, got shape {input_embed.shape}"
+        
+        # Get predictions from network
+        preds = self.net(track_hit_coords)
+        # preds = self.net(input_embed)
+        
+        # Ensure predictions have expected shape
+        assert preds.shape[-1] == self.output_dim, \
+            f"Expected {self.output_dim} output features but got {preds.shape[-1]}"
+        
+        # Add momentum if requested
+        if self.add_momentum:
+            preds = self.add_momentum_to_preds(preds)
+            
+        return {self.name: preds}
+
+    def add_momentum_to_preds(self, preds: Tensor):
+        momentum = torch.sqrt(preds[..., self.i_px] ** 2 + preds[..., self.i_py] ** 2 + preds[..., self.i_pz] ** 2)
+        preds = torch.cat([preds, momentum.unsqueeze(-1)], dim=-1)
+        return preds
+
+    def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        """Convert raw model outputs to unscaled predictions for evaluation.
+        
+        This method unscales the predictions since it's used for evaluation and logging,
+        not for loss calculation. The loss and cost functions work with scaled values.
+        
+        Parameters
+        ----------
+        outputs : dict[str, Tensor]
+            Dictionary containing model outputs with shape [batch_size, num_preds, num_features]
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary mapping each target name to its unscaled predicted values
+            in the original target space. Each tensor has shape [batch_size, num_preds].
+        """
+        if self.name not in outputs:
+            raise KeyError(f"Missing predictions for task {self.name}")
+            
+        preds = outputs[self.name]  # [batch, num_preds, num_features]
+        
+        if preds.shape[-1] != len(self.target_labels):
+            raise ValueError(
+                f"Expected predictions with {len(self.target_labels)} features, "
+                f"got {preds.shape[-1]}"
+            )
+        
+        # Unscale each feature
+        unscaled_preds = {}
+        for i, tgt in enumerate(self.target_labels):
+            try:
+                # All features including momentum need unscaling
+                unscaled_preds[f"{self.output_object}_{tgt}"] = self.scaler.inverse(tgt)(preds[..., i])
+            except Exception as e:
+                raise RuntimeError(f"Error unscaling feature {tgt}: {str(e)}")
+                
         return unscaled_preds

@@ -33,6 +33,23 @@ def smoothl1_costs(pred_logits, true):
     return losses.sum(-1)
 
 
+def mse_loss(pred_logits, true, mask=None, weight=None):  # noqa: ARG001
+    # TODO: Add support for mask?
+    losses = F.mse_loss(pred_logits, true, reduction="none")
+    if weight is not None:
+        losses = losses * weight
+    return losses.mean()
+
+def mse_costs(pred_logits, true):
+    # Expand dimensions to compute pairwise costs between predictions and targets
+    pred_expanded = pred_logits.unsqueeze(2).expand(-1, -1, true.shape[1], -1)
+    true_expanded = true.unsqueeze(1).expand(-1, pred_logits.shape[1], -1, -1)
+    # Compute pairwise MSE losses
+    losses = F.mse_loss(pred_expanded, true_expanded, reduction="none")
+    # Sum over the feature dimension to get a single cost per pred-target pair
+    return losses.sum(-1)
+
+
 def mask_dice_loss(pred_logits, true, mask=None, weight=None):
     pred = pred_logits.sigmoid()
     num = 2 * (pred * true)
@@ -109,6 +126,14 @@ cost_fns = {
     "mask_dice": mask_dice_costs,
     "mask_focal": mask_focal_costs,
     "smoothl1": smoothl1_costs,
+    "mse": mse_costs,
 }
 
-loss_fns = {"object_ce": object_ce_loss, "mask_ce": mask_ce_loss, "mask_dice": mask_dice_loss, "mask_focal": focal_loss, "smoothl1": smoothl1_loss}
+loss_fns = {
+    "object_ce": object_ce_loss,
+    "mask_ce": mask_ce_loss,
+    "mask_dice": mask_dice_loss,
+    "mask_focal": focal_loss,
+    "smoothl1": smoothl1_loss,
+    "mse": mse_loss,
+}

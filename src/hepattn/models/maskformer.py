@@ -165,11 +165,18 @@ class MaskFormer(nn.Module):
             for input_name in input_names:
                 x[input_name + "_embed"] = x["key_embed"][..., x[f"key_is_{input_name}"], :]
 
+        x["hit_coords"] = torch.cat([inputs[input_name + "_valid"] for input_name in ["x", "y", "z"]], dim=1)  # [batch, hits, 3]
+
         # Get the final outputs - we don't need to compute attention masks or update things here
         outputs["final"] = {}
+        track_hit_valid_masks: dict[str, Tensor] = {}
+        hit_valid_masks: Tensor | None = None
         for task in self.tasks:
             outputs["final"][task.name] = task(x)
-
+            track_hit_valid_masks[task.name] = task.attn_mask(outputs["final"][task.name])
+            hit_valid_masks[task.name] = task.query_mask(outputs["final"][task.name])
+            if "fp_regression" in task.name:
+                outputs["final"][task.name] = task(x, track_hit_valid_masks, hit_valid_masks)
         return outputs
 
     def predict(self, outputs: dict) -> dict:
