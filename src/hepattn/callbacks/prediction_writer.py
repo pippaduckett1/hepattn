@@ -86,6 +86,8 @@ class PredictionWriter(Callback):
         # sample_id/inputs/pixel_x
         items_group = sample_group.create_group(item_name)
         for name, value in items.items():
+            if name == "sample_id":
+                continue
             self.create_dataset(items_group, name, value[idx][None, ...])
 
     def write_layer_task_items(self, sample_group, item_name, items, idx):

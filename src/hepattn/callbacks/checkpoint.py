@@ -16,3 +16,4 @@ class Checkpoint(ModelCheckpoint):
                 return
             log_dir = Path(trainer.log_dir)
             self.dirpath = str(log_dir / "ckpts")
+            print("saving to", self.dirpath)

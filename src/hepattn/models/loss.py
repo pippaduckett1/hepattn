@@ -44,10 +44,16 @@ def mse_costs(pred_logits, true):
     # Expand dimensions to compute pairwise costs between predictions and targets
     pred_expanded = pred_logits.unsqueeze(2).expand(-1, -1, true.shape[1], -1)
     true_expanded = true.unsqueeze(1).expand(-1, pred_logits.shape[1], -1, -1)
-    # Compute pairwise MSE losses
-    losses = F.mse_loss(pred_expanded, true_expanded, reduction="none")
-    # Sum over the feature dimension to get a single cost per pred-target pair
-    return losses.sum(-1)
+    
+    # Compute MSE with built-in function for stability
+    costs = F.mse_loss(pred_expanded, true_expanded, reduction='none')
+    
+    # Sum over feature dimension and handle any invalid values
+    costs = costs.sum(-1)  # Sum features
+    costs = torch.nan_to_num(costs, nan=1e4, posinf=1e4, neginf=1e4)  # Handle invalid values
+    costs = torch.clamp(costs, min=0.0, max=1e4)  # Final clamp for safety
+    
+    return costs
 
 
 def mask_dice_loss(pred_logits, true, mask=None, weight=None):

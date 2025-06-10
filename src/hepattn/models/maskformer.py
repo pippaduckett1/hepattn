@@ -3,6 +3,7 @@ from torch import Tensor, nn
 
 from hepattn.models.decoder import MaskFormerDecoderLayer
 
+import sys
 
 class MaskFormer(nn.Module):
     def __init__(
@@ -107,6 +108,10 @@ class MaskFormer(nn.Module):
         x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)
         x["query_valid"] = torch.full((batch_size, self.num_queries), True)
 
+        x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in ["x", "y", "z"]], dim=-1)  # [batch, hits, 3]
+        # print(x["hit_coords"].shape) # [batch, hits, 3]
+        # print(x["hit_coords"][0,0,:])
+
         # Pass encoded inputs through decoder to produce outputs
         outputs = {}
         for layer_index, decoder_layer in enumerate(self.decoder_layers):
@@ -116,8 +121,12 @@ class MaskFormer(nn.Module):
             query_mask = None
 
             for task in self.tasks:
+                # print(task.name)
                 # Get the outputs of the task given the current embeddings and record them
-                task_outputs = task(x)
+                if "fp_regression" in task.name:
+                    task_outputs = task(x, {"track_hit_valid": attn_mask})
+                else:
+                    task_outputs = task(x)
 
                 outputs[f"layer_{layer_index}"][task.name] = task_outputs
 
@@ -165,18 +174,22 @@ class MaskFormer(nn.Module):
             for input_name in input_names:
                 x[input_name + "_embed"] = x["key_embed"][..., x[f"key_is_{input_name}"], :]
 
-        x["hit_coords"] = torch.cat([inputs[input_name + "_valid"] for input_name in ["x", "y", "z"]], dim=1)  # [batch, hits, 3]
-
         # Get the final outputs - we don't need to compute attention masks or update things here
         outputs["final"] = {}
         track_hit_valid_masks: dict[str, Tensor] = {}
-        hit_valid_masks: Tensor | None = None
+        hit_valid_masks: dict[str, Tensor] = {}
+
         for task in self.tasks:
-            outputs["final"][task.name] = task(x)
-            track_hit_valid_masks[task.name] = task.attn_mask(outputs["final"][task.name])
-            hit_valid_masks[task.name] = task.query_mask(outputs["final"][task.name])
             if "fp_regression" in task.name:
-                outputs["final"][task.name] = task(x, track_hit_valid_masks, hit_valid_masks)
+                # print(outputs["final"])
+                # 'track_hit_valid': {'track_hit_logit'
+                track_hit_valid_logits = outputs["final"]['track_hit_valid']['track_hit_logit']
+                outputs["final"][task.name] = task(x, track_hit_valid_logits, hit_valid_masks)
+                # outputs["final"][task.name] = task(x, track_hit_valid_masks, hit_valid_masks)
+            else:
+                outputs["final"][task.name] = task(x)
+                track_hit_valid_masks[task.name] = task.attn_mask(outputs["final"][task.name])
+                hit_valid_masks[task.name] = task.query_mask(outputs["final"][task.name])
         return outputs
 
     def predict(self, outputs: dict) -> dict:
@@ -220,6 +233,8 @@ class MaskFormer(nn.Module):
             # Get the cost contribution from each of the tasks
             for task in self.tasks:
                 # Only use the cost from the final set of predictions
+                if (task.name == "fp_regression") and (layer_name!="final"):
+                    continue
                 task_costs = task.cost(layer_outputs[task.name], targets)
 
                 # Add the cost on to our running cost total, otherwise initialise a running cost matrix
@@ -247,6 +262,8 @@ class MaskFormer(nn.Module):
         for layer_name in outputs:
             losses[layer_name] = {}
             for task in self.tasks:
+                if (task.name == "fp_regression") and (layer_name!="final"):
+                    continue
                 losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
 
         return losses
