@@ -305,6 +305,7 @@ class RegressionTask(Task):
         costs: dict[str, float],
         net: nn.Module | None = None,
         add_momentum: bool = False, 
+        combine_phi: bool = False,
         **kwargs
     ):   
         """Regression task without uncertainty prediction.
@@ -339,6 +340,7 @@ class RegressionTask(Task):
         self.losses = losses
         self.costs = costs
         self.add_momentum = add_momentum
+        self.combine_phi = combine_phi
         if net is None:
             raise ValueError("net parameter must not be None")
         self.net = net
@@ -351,6 +353,13 @@ class RegressionTask(Task):
             self.i_px = self.target_labels.index("px")
             self.i_py = self.target_labels.index("py")
             self.i_pz = self.target_labels.index("pz")
+                
+        if self.combine_phi:
+            assert all([t in self.target_labels for t in ["sinphi", "cosphi"]])
+            self.target_labels.append("phi")
+            self.i_sinphi = self.target_labels.index("sinphi")
+            self.i_cosphi = self.target_labels.index("cosphi")
+
 
     def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
         """Compute regression loss between predictions and targets.
@@ -496,6 +505,11 @@ class RegressionTask(Task):
         preds = torch.cat([preds, momentum.unsqueeze(-1)], dim=-1)
         return preds
 
+    def combine_phi_in_preds(self, preds: Tensor):
+        phi =  torch.arctan(preds[..., self.i_sinphi] / preds[..., self.i_cosphi])
+        preds = torch.cat([preds, phi.unsqueeze(-1)], dim=-1)
+        return preds
+    
     def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
         """Convert raw model outputs to unscaled predictions for evaluation.
         
@@ -537,6 +551,160 @@ class RegressionTask(Task):
     
 
 
+class FPRegressionTaskHitObjRepr(RegressionTask):
+
+    def __init__(
+        self,
+        name: str,
+        target_labels: list[str],
+        input_object: str,
+        output_object: str,
+        scaler: RegressionTargetScaler,
+        losses: dict[str, float],
+        costs: dict[str, float],
+        net: nn.Module | None = None,
+        add_momentum: bool = False,
+        combine_phi: bool = False,
+        **kwargs
+    ):
+        """Regression task that uses hit object representations.
+        
+        Parameters are the same as RegressionTask, with additional parameters:
+        combine_phi : bool
+            Whether to combine phi coordinates in the hit representation
+        """
+        super().__init__(
+            name=name,
+            target_labels=target_labels,
+            input_object=input_object,
+            output_object=output_object,
+            scaler=scaler,
+            losses=losses,
+            costs=costs,
+            net=net,
+            add_momentum=add_momentum,
+            combine_phi=combine_phi,
+            **kwargs
+        )
+
+
+    def forward(self, x: dict[str, Tensor], track_hit_valid_mask: dict[str, Tensor] | None = None, track_valid_mask: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+        """Forward pass for regression predictions using hit object representations.
+        
+        Parameters
+        ----------
+        x : dict[str, Tensor]
+            Dictionary containing input tensors. Must contain:
+            - query_embed: [batch_size, num_queries, embedding_dim]
+            - hit_embed: [batch_size, num_hits, embedding_dim]
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary containing predictions with key self.name and shape
+            [batch_size, num_queries, num_features]
+        """
+        query_embed = x["query_embed"]
+        hit_embed = x["hit_embed"]
+
+        if track_hit_valid_mask is None:
+            raise ValueError("track_hit_valid_mask is required")
+        
+        is_mask = isinstance(track_hit_valid_mask, dict)
+        
+        def get_hit_embeds_from_logits(track_hit_assignment_logits, hit_embed):
+            # Count number of hits per track using a threshold on the logits
+
+            track_hit_assignment_mask = (track_hit_assignment_logits > 0.1)
+            num_hits_per_track = track_hit_assignment_mask.sum(dim=-1)  # [batch, num_queries]
+            
+            # Initialize output tensor
+            batch_size, num_queries, _ = track_hit_assignment_logits.shape
+            track_hit_embeds = torch.zeros(batch_size, num_queries, hit_embed.shape[-1], device=hit_embed.device)
+
+            # For each track that has hits assigned, gather and do weighted average of its hit embeddings
+            for b in range(batch_size):
+                for q in range(num_queries):
+                    if num_hits_per_track[b, q] > 0:
+                        # Get indices and scores of assigned hits
+                        hit_indices = torch.where(track_hit_assignment_mask[b, q])[0]
+                        
+                        hit_scores = track_hit_assignment_logits[b, q, hit_indices].sigmoid()  # Convert logits to probabilities
+                        
+                        # Gather coordinates for selected hits
+                        track_hits = hit_embed[b, hit_indices]  # [num_hits, embed_dim]
+                        
+                        # Compute weighted average using the scores
+                        weights = hit_scores.unsqueeze(-1)  # [num_hits, 1]
+                        weighted_sum = (track_hits * weights).sum(dim=0)  # [embed_dim]
+                        normalization = weights.sum()
+
+                        # Store normalized weighted average
+                        track_hit_embeds[b, q] = weighted_sum / normalization
+
+            return track_hit_embeds
+        
+        def get_hit_embeds(track_hit_assignment: Tensor, hit_embed: Tensor) -> Tensor:
+            # Count number of hits per track
+            num_hits_per_track = track_hit_assignment.sum(dim=-1)  # [batch, num_queries]
+            
+            # Initialize output tensor
+            batch_size, num_queries, _ = track_hit_assignment.shape
+            track_hit_embeds = torch.zeros(batch_size, num_queries, hit_embed.shape[-1], device=hit_embed.device)
+            
+            # For each track that has hits assigned, gather and average its hit embeddings
+            for b in range(batch_size):
+                for q in range(num_queries):
+                    if num_hits_per_track[b, q] > 0:
+                        # Get indices of assigned hits
+                        hit_indices = torch.where(track_hit_assignment[b, q])[0]
+                        
+                        # Gather embeddings for all assigned hits
+                        track_hits = hit_embed[b, hit_indices]  # [num_hits, embed_dim]
+                        
+                        # Average the embeddings
+                        track_hit_embeds[b, q] = track_hits.mean(dim=0)
+
+            return track_hit_embeds
+
+
+        # Get hit embeddings based on track-hit assignments
+        if is_mask:
+            track_hit_assignment = track_hit_valid_mask["track_hit_valid"]  # [batch, num_queries, num_hits]
+            track_hit_embeds = get_hit_embeds(track_hit_assignment, hit_embed)
+        else:
+            track_hit_assignment_logits = track_hit_valid_mask
+            track_hit_embeds = get_hit_embeds_from_logits(track_hit_assignment_logits, hit_embed)
+
+        # Combine query embeddings with hit embeddings
+        combined_embed = torch.cat([query_embed, track_hit_embeds], dim=-1)
+        
+        # Get predictions from network
+        preds = self.net(combined_embed)
+        
+        # Ensure predictions have expected shape
+        expected_features = len(self.target_labels) - (1 if self.add_momentum else 0)
+        assert preds.shape[-1] == expected_features, \
+            f"Expected {expected_features} output features but got {preds.shape[-1]}"
+        
+        # Add momentum if requested
+        if self.add_momentum:
+            preds = self.add_momentum_to_preds(preds)
+            
+        return {self.name: preds}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class FPRegressionTask(Task):
     def __init__(
@@ -553,6 +721,7 @@ class FPRegressionTask(Task):
         max_hits: int,
         net: nn.Module | None = None,
         add_momentum: bool = False, 
+        combine_phi: bool = False,
         **kwargs
     ):   
         """Regression task without uncertainty prediction.
@@ -588,6 +757,7 @@ class FPRegressionTask(Task):
         self.costs = costs
         self.add_embed = add_embed
         self.add_momentum = add_momentum
+        self.combine_phi = combine_phi
         self.hit_input_vars = hit_input_vars
         self.max_hits = max_hits
         
@@ -597,7 +767,7 @@ class FPRegressionTask(Task):
         self.net = net
         
         # Output dimension for predictions
-        self.output_dim = len(self.target_labels) + (1 if self.add_momentum else 0)
+        self.output_dim = len(self.target_labels) + (1 if self.add_momentum else 0) + (1 if self.combine_phi else 0)
         
         self.outputs = [self.name]
 
@@ -607,6 +777,13 @@ class FPRegressionTask(Task):
             self.i_px = self.target_labels.index("px")
             self.i_py = self.target_labels.index("py")
             self.i_pz = self.target_labels.index("pz")
+
+                
+        if self.combine_phi:
+            assert all([t in self.target_labels for t in ["sinphi", "cosphi"]])
+            self.target_labels.append("phi")
+            self.i_sinphi = self.target_labels.index("sinphi")
+            self.i_cosphi = self.target_labels.index("cosphi")
 
     def loss(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
         """Compute regression loss between predictions and targets.
@@ -637,6 +814,7 @@ class FPRegressionTask(Task):
                 if target_key not in targets:
                     raise KeyError(f"Missing target {target_key}")
                 scaled_tgt = self.scaler.scale(tgt)(targets[target_key])
+                # scaled_tgt = torch.nan_to_num(scaled_tgt, nan=0.0, posinf=1e4, neginf=-1e4)
                 label_tensors.append(scaled_tgt.unsqueeze(-1))
             except Exception as e:
                 raise RuntimeError(f"Error processing target {tgt}: {str(e)}")
@@ -691,6 +869,442 @@ class FPRegressionTask(Task):
         labels = []
         for tgt in self.target_labels:
             scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
+            # scaled_tgt = torch.nan_to_num(scaled_tgt, nan=0.0, posinf=1e4, neginf=-1e4)
+            labels.append(scaled_tgt.unsqueeze(-1))
+        labels = torch.cat(labels, dim=-1)
+
+        # Get valid indices - create a new tensor instead of modifying in place
+        valid_idx = targets[f"{self.output_object}_valid"].clone()
+        valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
+        valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
+
+        # Initialize cost dictionary
+        cost_dict = {}
+
+        for cost_fn, cost_weight in self.costs.items():
+            # Calculate the base costs between all pred-target pairs
+            base_costs = cost_weight * cost_fns[cost_fn](preds, labels)
+            # Create mask for invalid targets
+            # Create mask for invalid targets - create new tensor
+            mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1).clone()
+            # Create a new tensor for costs with masked values set to 1e6
+            costs = torch.where(
+                mask,
+                base_costs,
+                torch.full_like(base_costs, 1e6)
+            )
+            cost_dict[cost_fn] = costs
+        
+        return cost_dict
+
+    def forward(self, x: dict[str, Tensor], track_hit_valid_mask: dict[str, Tensor] | None = None, track_valid_mask: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+        """Forward pass for regression predictions.
+        
+        Parameters
+        ----------
+        x : dict[str, Tensor]
+            Dictionary containing input tensors. Must contain key f"{input_object}_embed"
+            with shape [batch_size, num_queries, embedding_dim].
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary containing predictions with key self.name and shape
+            [batch_size, num_queries, num_features], where num_features is
+            len(target_labels).
+        """
+        input_embed = x["query_embed"]
+        # hit_valid_mask = track_valid_mask["hit_valid"]
+        #TODO only 6 hits?
+
+        # want tensor of shape [batch, num_queries, 3*max_num_hits]
+        # where max_num_hits is the max number of hits per track
+        # and the tensor is filled with the coords of the hits that are assigned to the tracks
+        # and padded with zeros for the rest
+        # if no track hit assignment mask is provided, then throw error
+
+        input_coords = x["hit_coords"]  # [batch, hits, 3]
+        
+        # Get track-hit assignments, error if not provided
+        if track_hit_valid_mask is None:
+            raise ValueError("track_hit_valid_mask is required")
+        
+        is_mask = isinstance(track_hit_valid_mask, dict)
+
+
+        def get_hit_coords(track_hit_assignment: Tensor, input_coords: Tensor) -> Tensor:
+            """Process hit coordinates from binary assignment mask.
+            
+            Parameters
+            ----------
+            track_hit_assignment : Tensor [batch, num_queries, num_hits]
+                Binary mask indicating which hits belong to which track
+            input_coords : Tensor [batch, num_hits, coord_dim]
+                Input coordinates for each hit
+                
+            Returns
+            -------
+            Tensor [batch, num_queries, max_hits * coord_dim]
+                Flattened and padded hit coordinates for each track
+            """
+            batch_size, num_queries, num_hits = track_hit_assignment.shape
+            coord_dim = input_coords.shape[-1]
+            
+            # Initialize output tensor
+            track_hit_coords = torch.zeros(
+                batch_size, num_queries, self.max_hits * coord_dim,
+                device=input_coords.device
+            )
+
+            # Process each batch and query
+            for b in range(batch_size):
+                for q in range(num_queries):
+                    # Get indices of assigned hits for this track
+                    hit_indices = torch.where(track_hit_assignment[b, q])[0]
+                    
+                    if len(hit_indices) == 0:
+                        continue
+                        
+                    # If we have more hits than max_hits, randomly select max_hits
+                    if len(hit_indices) > self.max_hits:
+                        perm = torch.randperm(len(hit_indices), device=hit_indices.device)
+                        hit_indices = hit_indices[perm[:self.max_hits]]
+                    
+                    # Get coordinates for selected hits
+                    selected_coords = input_coords[b, hit_indices]  # [num_selected, coord_dim]
+                    
+                    # Flatten coordinates and store in output tensor
+                    flat_coords = selected_coords.reshape(-1)  # [num_selected * coord_dim]
+                    track_hit_coords[b, q, :len(flat_coords)] = flat_coords
+
+            return track_hit_coords
+        
+        def get_hit_coords_from_logits(track_hit_assignment_logits: Tensor, input_coords: Tensor) -> Tensor:
+            """Process hit coordinates from assignment logits.
+            
+            Parameters
+            ----------
+            track_hit_assignment_logits : Tensor [batch, num_queries, num_hits]
+                Logits indicating hit assignment probabilities
+            input_coords : Tensor [batch, num_hits, coord_dim]
+                Input coordinates for each hit
+                
+            Returns
+            -------
+            Tensor [batch, num_queries, max_hits * coord_dim]
+                Flattened and padded hit coordinates for each track
+            """
+            batch_size, num_queries, num_hits = track_hit_assignment_logits.shape
+            coord_dim = input_coords.shape[-1]
+            
+            # Initialize output tensor
+            track_hit_coords = torch.zeros(
+                batch_size, num_queries, self.max_hits * coord_dim,
+                device=input_coords.device
+            )
+
+            # Convert logits to probabilities
+            probs = track_hit_assignment_logits.sigmoid()
+
+            # Process each batch and query
+            for b in range(batch_size):
+                for q in range(num_queries):
+                    # Get hits above threshold
+                    valid_hits = torch.where(probs[b, q] > 0.1)[0]
+                    
+                    if len(valid_hits) == 0:
+                        continue
+                    
+                    # If we have more hits than max_hits, take top scoring ones
+                    if len(valid_hits) > self.max_hits:
+                        scores = probs[b, q, valid_hits]
+                        _, top_indices = torch.topk(scores, k=self.max_hits)
+                        valid_hits = valid_hits[top_indices]
+                    
+                    # Get coordinates for selected hits
+                    selected_coords = input_coords[b, valid_hits]  # [num_selected, coord_dim]
+                    
+                    # Flatten coordinates and store in output tensor
+                    flat_coords = selected_coords.reshape(-1)  # [num_selected * coord_dim]
+                    track_hit_coords[b, q, :len(flat_coords)] = flat_coords
+
+            return track_hit_coords
+
+
+
+        # def get_hit_coords(track_hit_assignment: Tensor, input_coords: Tensor) -> Tensor:
+        #     """Vectorized version of hit coordinate processing.
+            
+        #     Parameters
+        #     ----------
+        #     track_hit_assignment : Tensor [batch, num_queries, num_hits]
+        #         Binary mask indicating which hits belong to which track
+            # input_coords : Tensor [batch, num_hits, coord_dim]
+            #     Input coordinates for each hit
+                
+            # Returns
+            # -------
+            # Tensor [batch, num_queries, max_hits * coord_dim]
+            #     Flattened and padded hit coordinates for each track
+            # """
+            # batch_size, num_queries, num_hits = track_hit_assignment.shape
+            # coord_dim = input_coords.shape[-1]
+            
+            # # Count hits per track
+            # num_hits_per_track = track_hit_assignment.sum(dim=-1)  # [batch, num_queries]
+            
+            # # Create output tensor
+            # track_hit_coords = torch.zeros(
+            #     batch_size, num_queries, self.max_hits * coord_dim,
+            #     device=input_coords.device
+            # )
+
+            # # For tracks with hits, gather and process their coordinates
+            # has_hits = num_hits_per_track > 0
+            # if not has_hits.any():
+            #     return track_hit_coords
+
+            # # Get indices of hits for each track
+            # hit_indices = torch.nonzero(track_hit_assignment.view(-1, num_hits), as_tuple=False)
+            # batch_query_idx = hit_indices[:, 0]
+            # hit_idx = hit_indices[:, 1]
+
+            # # Reshape batch_query_idx to get batch and query indices
+            # batch_idx = batch_query_idx // num_queries
+            # query_idx = batch_query_idx % num_queries
+
+            # # Gather coordinates for all hits
+            # gathered_coords = input_coords[batch_idx, hit_idx]  # [num_total_hits, coord_dim]
+
+            # # Create position indices for scattering
+            # hits_so_far = torch.zeros(batch_size, num_queries, dtype=torch.long, device=input_coords.device)
+            # pos_indices = hits_so_far[batch_idx, query_idx]
+            # hits_so_far[batch_idx, query_idx] += 1
+
+            # # Only keep up to max_hits coordinates per track
+            # valid_hits = pos_indices < self.max_hits
+            # if valid_hits.any():
+            #     batch_idx = batch_idx[valid_hits]
+            #     query_idx = query_idx[valid_hits]
+            #     pos_indices = pos_indices[valid_hits]
+            #     gathered_coords = gathered_coords[valid_hits]
+
+            #     # Calculate indices for flattened coordinates
+            #     flat_coords = gathered_coords.view(-1)  # [num_valid_hits * coord_dim]
+            #     coord_indices = pos_indices.unsqueeze(-1) * coord_dim + torch.arange(coord_dim, device=input_coords.device)
+            #     coord_indices = coord_indices.view(-1)  # [num_valid_hits * coord_dim]
+
+            #     # Scatter the coordinates into the output tensor
+            #     track_hit_coords[batch_idx, query_idx, coord_indices] = flat_coords
+
+            # return track_hit_coords
+        
+        # def get_hit_coords_from_logits(track_hit_assignment_logits: Tensor, input_coords: Tensor) -> Tensor:
+        #     """Vectorized version of hit coordinate processing from logits.
+            
+        #     Parameters
+        #     ----------
+        #     track_hit_assignment_logits : Tensor [batch, num_queries, num_hits]
+        #         Logits indicating hit assignment probabilities
+        #     input_coords : Tensor [batch, num_hits, coord_dim]
+        #         Input coordinates for each hit
+                
+        #     Returns
+        #     -------
+        #     Tensor [batch, num_queries, max_hits * coord_dim]
+        #         Flattened and padded hit coordinates for each track
+        #     """
+        #     # Convert logits to mask using threshold
+        #     track_hit_assignment = (track_hit_assignment_logits > 0.1)
+            
+        #     # For tracks with more hits than max_hits, keep only top scoring hits
+        #     num_hits_per_track = track_hit_assignment.sum(dim=-1)  # [batch, num_queries]
+        #     too_many_hits = num_hits_per_track > self.max_hits
+            
+        #     if too_many_hits.any():
+        #         # Get scores for assigned hits
+        #         scores = track_hit_assignment_logits.masked_fill(~track_hit_assignment, float('-inf'))
+        #         # Get top k scores
+        #         _, top_indices = torch.topk(scores, k=self.max_hits, dim=-1)
+        #         # Create new assignment mask with only top k hits
+        #         new_assignment = torch.zeros_like(track_hit_assignment)
+        #         new_assignment.scatter_(-1, top_indices, 1)
+        #         # Update assignment mask
+        #         track_hit_assignment = torch.where(too_many_hits.unsqueeze(-1), new_assignment, track_hit_assignment)
+            
+        #     return get_hit_coords(track_hit_assignment, input_coords)
+        
+        # def get_hit_coords_from_logits(track_hit_assignment_logits, input_coords):
+        #     # Count number of hits per track
+        #     track_hit_assignment_mask = (track_hit_assignment_logits > 0.1)
+        #     num_hits_per_track = track_hit_assignment_mask.sum(dim=-1)  # [batch, num_queries]
+            
+        #     # Initialize output tensor
+        #     batch_size, num_queries, _ = track_hit_assignment_logits.shape
+        #     track_hit_coords = torch.zeros(batch_size, num_queries, self.max_hits * input_coords.shape[-1], device=input_coords.device)
+            
+        #     # For each track that has hits assigned, gather and flatten its hit coordinates
+        #     for b in range(batch_size):
+        #         for q in range(num_queries):
+        #             if num_hits_per_track[b, q] > 0:
+        #                 # Get indices of assigned hits
+        #                 hit_indices = torch.where(track_hit_assignment_mask[b, q])[0]
+                        
+        #                 # If we have more hits than max_hits, select the top scoring hits
+        #                 if len(hit_indices) > self.max_hits:
+        #                     # Get the logit scores for the assigned hits
+        #                     hit_scores = track_hit_assignment_logits[b, q, hit_indices]
+        #                     # Sort hits by scores in descending order and get indices
+        #                     _, top_k_indices = torch.topk(hit_scores, k=self.max_hits)
+        #                     hit_indices = hit_indices[top_k_indices]
+                        
+        #                 # Gather coordinates for selected hits
+        #                 track_hits = input_coords[b, hit_indices]  # [num_hits, 3]
+                        
+        #                 # Handle padding - only take up to max_hits coordinates
+        #                 num_hits_to_use = min(len(hit_indices), self.max_hits)
+        #                 flattened_coords = track_hits[:num_hits_to_use].flatten()  # [num_hits_to_use * 3]
+                        
+        #                 # Store coordinates - the rest will remain as zeros for padding
+        #                 track_hit_coords[b, q, :num_hits_to_use * 3] = flattened_coords
+
+        #     return track_hit_coords
+        
+        # def get_hit_coords(track_hit_assignment, input_coords):
+        #     # Count number of hits per track
+        #     num_hits_per_track = track_hit_assignment.sum(dim=-1)  # [batch, num_queries]
+            
+        #     # Initialize output tensor
+        #     batch_size, num_queries, num_input_hit_vars = track_hit_assignment.shape
+        #     track_hit_coords = torch.zeros(batch_size, num_queries, self.max_hits * input_coords.shape[-1], device=input_coords.device)
+            
+        #     # For each track that has hits assigned, gather and flatten its hit coordinates
+        #     for b in range(batch_size):
+        #         for q in range(num_queries):
+        #             if num_hits_per_track[b, q] > 0:
+        #                 # Get indices of assigned hits
+        #                 hit_indices = torch.where(track_hit_assignment[b, q])[0]
+                        
+        #                 # If we have more hits than max_hits, randomly select max_hits of them
+        #                 if len(hit_indices) > self.max_hits:
+        #                     perm = torch.randperm(len(hit_indices), device=hit_indices.device)
+        #                     hit_indices = hit_indices[perm[:self.max_hits]]
+                        
+        #                 # Gather coordinates for selected hits
+        #                 track_hits = input_coords[b, hit_indices]  # [num_hits, 3]
+                        
+        #                 # Handle padding - only take up to max_hits coordinates
+        #                 num_hits_to_use = min(len(hit_indices), self.max_hits)
+        #                 flattened_coords = track_hits[:num_hits_to_use].flatten()  # [num_hits_to_use * 3]
+                        
+        #                 # Store coordinates - the rest will remain as zeros for padding
+        #                 track_hit_coords[b, q, :num_hits_to_use * 3] = flattened_coords
+
+        #     return track_hit_coords
+
+        if is_mask:
+            track_hit_assignment = track_hit_valid_mask["track_hit_valid"]  # [batch, num_queries, num_hits]
+            # Get hit coordinates
+            track_hit_coords = get_hit_coords(track_hit_assignment, input_coords)
+        else:
+            track_hit_assignment_logits = track_hit_valid_mask.detach().sigmoid()
+            track_hit_coords = get_hit_coords_from_logits(track_hit_assignment_logits, input_coords)
+
+
+            # Now track_hit_coords has shape [batch, num_queries, max_hits*3]
+            # with coordinates of assigned hits, padded with zeros
+
+        # Check input dimensions
+        assert input_embed.dim() == 3, f"Expected 3D input tensor, got shape {input_embed.shape}"
+
+        embed = torch.cat([input_embed, track_hit_coords], dim=-1)
+        
+        # Get predictions from network
+        preds = self.net(embed)
+        # preds = self.net(input_embed)
+
+        # Add momentum if requested
+        if self.add_momentum:
+            preds = self.add_momentum_to_preds(preds)
+
+        if self.combine_phi:
+            preds = self.combine_phi_in_preds(preds)
+            
+        # Ensure predictions have expected shape
+        assert preds.shape[-1] == self.output_dim, \
+            f"Expected {self.output_dim} output features but got {preds.shape[-1]}"
+            
+        return {self.name: preds}
+
+
+    def add_momentum_to_preds(self, preds: Tensor):
+        momentum = torch.sqrt(preds[..., self.i_px] ** 2 + preds[..., self.i_py] ** 2 + preds[..., self.i_pz] ** 2)
+        preds = torch.cat([preds, momentum.unsqueeze(-1)], dim=-1)
+        return preds
+    
+    def combine_phi_in_preds(self, preds: Tensor):
+        phi =  torch.arctan(preds[..., self.i_sinphi] / preds[..., self.i_cosphi])
+        preds = torch.cat([preds, phi.unsqueeze(-1)], dim=-1)
+        return preds
+
+    def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        """Convert raw model outputs to unscaled predictions for evaluation.
+        
+        This method unscales the predictions since it's used for evaluation and logging,
+        not for loss calculation. The loss and cost functions work with scaled values.
+        
+        Parameters
+        ----------
+        outputs : dict[str, Tensor]
+            Dictionary containing model outputs with shape [batch_size, num_preds, num_features]
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary mapping each target name to its unscaled predicted values
+            in the original target space. Each tensor has shape [batch_size, num_preds].
+        """
+        if self.name not in outputs:
+            raise KeyError(f"Missing predictions for task {self.name}")
+            
+        preds = outputs[self.name]  # [batch, num_preds, num_features]
+        
+        if preds.shape[-1] != len(self.target_labels):
+            raise ValueError(
+                f"{self.target_labels}"
+                f"Expected predictions with {len(self.target_labels)} features, "
+                f"got {preds.shape[-1]}"
+            )
+        
+        # Unscale each feature
+        unscaled_preds = {}
+        for i, tgt in enumerate(self.target_labels):
+            try:
+                # All features including momentum need unscaling
+                unscaled_preds[f"{self.output_object}_{tgt}"] = self.scaler.inverse(tgt)(preds[..., i])
+            except Exception as e:
+                raise RuntimeError(f"Error unscaling feature {tgt}: {str(e)}")
+                
+        return unscaled_preds
+
+
+
+
+
+class FPRegressionTaskHitOnly(FPRegressionTask):
+
+       
+    def cost(self, outputs, targets):
+        
+        # Detach predictions and get the relevant predictions
+        preds = outputs[self.name].detach()
+        
+        # Build labels array just like in loss function
+        labels = []
+        for tgt in self.target_labels:
+            print(targets.keys())
+            scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
+            scaled_tgt = torch.nan_to_num(scaled_tgt, nan=0.0, posinf=1e4, neginf=-1e4)
             labels.append(scaled_tgt.unsqueeze(-1))
         labels = torch.cat(labels, dim=-1)
 
@@ -756,43 +1370,67 @@ class FPRegressionTask(Task):
             raise ValueError("track_hit_valid_mask is required")
         track_hit_assignment = track_hit_valid_mask["track_hit_valid"]  # [batch, num_queries, num_hits]
 
-        # Get hit coordinates
-        track_hit_coords = get_hit_coords(track_hit_assignment, input_coords)
-
         def get_hit_coords(track_hit_assignment, input_coords):
             # Count number of hits per track
             # extract hits for tracks from valid mask then extract the coords
             # find max num hits and pad up to this
             # for those hits so that final input is [batch, valid_query, 3*max_num_hits]
             num_hits_per_track = track_hit_assignment.sum(dim=-1)  # [batch, num_queries]
-
-            
             # Initialize output tensor
-            batch_size, num_queries, num_input_hit_vars = track_hit_assignment.shape
-            track_hit_coords = torch.zeros(batch_size, num_queries, self.max_hits * num_input_hit_vars, device=input_coords.device)
+            batch_size, num_queries, _ = track_hit_assignment.shape
+            track_hit_coords = torch.zeros(batch_size, num_queries, self.max_hits * input_coords.shape[-1], device=input_coords.device)
             
-            # For each track that has hits assigned, gather and flatten its hit coordinates
+              # For each track that has hits assigned, gather and flatten its hit coordinates
             for b in range(batch_size):
                 for q in range(num_queries):
                     if num_hits_per_track[b, q] > 0:
                         # Get indices of assigned hits
                         hit_indices = torch.where(track_hit_assignment[b, q])[0]
-                        # Gather coordinates for those hits and flatten
-                        track_hits = input_coords[b, hit_indices]  # [num_hits, 3]
-                        #TODO do I need to add padding here?
                         
-                        track_hit_coords[b, q, :int(num_hits_per_track[b, q] * 3)] = track_hits.flatten()
+                        # If we have more hits than max_hits, randomly select max_hits of them
+                        if len(hit_indices) > self.max_hits:
+                            perm = torch.randperm(len(hit_indices), device=hit_indices.device)
+                            hit_indices = hit_indices[perm[:self.max_hits]]
+                        
+                        # Gather coordinates for selected hits
+                        track_hits = input_coords[b, hit_indices]  # [num_hits, 3]
+                        
+                        # Handle padding - only take up to max_hits coordinates
+                        num_hits_to_use = min(len(hit_indices), self.max_hits)
+                        flattened_coords = track_hits[:num_hits_to_use].flatten()  # [num_hits_to_use * 3]
+                        
+                        # Store coordinates - the rest will remain as zeros for padding
+                        track_hit_coords[b, q, :num_hits_to_use * 3] = flattened_coords
+
+            print(batch_size)
+            print(num_queries)
+            print(self.max_hits *3)
 
             return track_hit_coords
-            
-            # Now track_hit_coords has shape [batch, num_queries, max_hits*3]
-            # with coordinates of assigned hits, padded with zeros
+        
+        print(track_hit_assignment)
+        if isinstance(track_hit_assignment, torch.Tensor):
+            print("is tensor...")
+        else:
+            print(track_hit_assignment.keys())
+            track_hit_assignment = track_hit_assignment['hit']
+        
+        # Get hit coordinates
+        track_hit_coords = get_hit_coords(track_hit_assignment, input_coords)
+
+        print(track_hit_coords.shape)
+
+        embed = torch.cat([input_embed, track_hit_coords], dim=-1)
+
+        # Now track_hit_coords has shape [batch, num_queries, max_hits*3]
+        # with coordinates of assigned hits, padded with zeros
 
         # Check input dimensions
         assert input_embed.dim() == 3, f"Expected 3D input tensor, got shape {input_embed.shape}"
         
         # Get predictions from network
-        preds = self.net(track_hit_coords)
+        print(track_hit_coords.shape)
+        preds = self.net(embed)
         # preds = self.net(input_embed)
         
         # Ensure predictions have expected shape
@@ -804,47 +1442,3 @@ class FPRegressionTask(Task):
             preds = self.add_momentum_to_preds(preds)
             
         return {self.name: preds}
-
-    def add_momentum_to_preds(self, preds: Tensor):
-        momentum = torch.sqrt(preds[..., self.i_px] ** 2 + preds[..., self.i_py] ** 2 + preds[..., self.i_pz] ** 2)
-        preds = torch.cat([preds, momentum.unsqueeze(-1)], dim=-1)
-        return preds
-
-    def predict(self, outputs: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
-        """Convert raw model outputs to unscaled predictions for evaluation.
-        
-        This method unscales the predictions since it's used for evaluation and logging,
-        not for loss calculation. The loss and cost functions work with scaled values.
-        
-        Parameters
-        ----------
-        outputs : dict[str, Tensor]
-            Dictionary containing model outputs with shape [batch_size, num_preds, num_features]
-            
-        Returns
-        -------
-        dict[str, Tensor]
-            Dictionary mapping each target name to its unscaled predicted values
-            in the original target space. Each tensor has shape [batch_size, num_preds].
-        """
-        if self.name not in outputs:
-            raise KeyError(f"Missing predictions for task {self.name}")
-            
-        preds = outputs[self.name]  # [batch, num_preds, num_features]
-        
-        if preds.shape[-1] != len(self.target_labels):
-            raise ValueError(
-                f"Expected predictions with {len(self.target_labels)} features, "
-                f"got {preds.shape[-1]}"
-            )
-        
-        # Unscale each feature
-        unscaled_preds = {}
-        for i, tgt in enumerate(self.target_labels):
-            try:
-                # All features including momentum need unscaling
-                unscaled_preds[f"{self.output_object}_{tgt}"] = self.scaler.inverse(tgt)(preds[..., i])
-            except Exception as e:
-                raise RuntimeError(f"Error unscaling feature {tgt}: {str(e)}")
-                
-        return unscaled_preds

@@ -3,7 +3,6 @@ from torch import Tensor, nn
 
 from hepattn.models.decoder import MaskFormerDecoderLayer
 
-import sys
 
 class MaskFormer(nn.Module):
     def __init__(
@@ -109,8 +108,6 @@ class MaskFormer(nn.Module):
         x["query_valid"] = torch.full((batch_size, self.num_queries), True)
 
         x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in ["x", "y", "z"]], dim=-1)  # [batch, hits, 3]
-        # print(x["hit_coords"].shape) # [batch, hits, 3]
-        # print(x["hit_coords"][0,0,:])
 
         # Pass encoded inputs through decoder to produce outputs
         outputs = {}
@@ -121,7 +118,6 @@ class MaskFormer(nn.Module):
             query_mask = None
 
             for task in self.tasks:
-                # print(task.name)
                 # Get the outputs of the task given the current embeddings and record them
                 if "fp_regression" in task.name:
                     task_outputs = task(x, {"track_hit_valid": attn_mask})
@@ -181,8 +177,6 @@ class MaskFormer(nn.Module):
 
         for task in self.tasks:
             if "fp_regression" in task.name:
-                # print(outputs["final"])
-                # 'track_hit_valid': {'track_hit_logit'
                 track_hit_valid_logits = outputs["final"]['track_hit_valid']['track_hit_logit']
                 outputs["final"][task.name] = task(x, track_hit_valid_logits, hit_valid_masks)
                 # outputs["final"][task.name] = task(x, track_hit_valid_masks, hit_valid_masks)
