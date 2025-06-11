@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader, Dataset
 
 from hepattn.utils.tensor import pad_to_size
 
-import sys
 
 def is_valid_file(path):
     path = Path(path)
@@ -190,16 +189,13 @@ class ITkDataset(Dataset):
         inputs = {}
         for hit, fields in self.inputs.items():
             inputs[f"{hit}_valid"] = np.ones(len(hits[hit]), dtype=bool)
-            # inputs[f"{hit}_on_valid_particle"] = np.ones(len(hits[hit]["on_valid_particle"]), dtype=bool)
 
             for field in fields:
                 inputs[f"{hit}_{field}"] = hits[hit][field].to_numpy()
 
         # Hit filter target
         targets = {}
-        print([el for el in self.inputs])
         for hit in self.inputs:
-            print(hit)
             targets[f"{hit}_valid"] = np.ones(len(hits[hit]), dtype=bool)
             targets[f"{hit}_on_valid_particle"] = hits[hit]["on_valid_particle"].to_numpy(dtype=bool)
 
@@ -214,8 +210,6 @@ class ITkDataset(Dataset):
             targets["particle_valid"] = particles["pt"].to_numpy() >= self.particle_min_pt
             for field in self.targets["particle"]:
                 targets[f"particle_{field}"] = particles[field].to_numpy()
-
-        print(targets.keys())
 
         # Add metadata
         targets["sample_id"] = sample_id

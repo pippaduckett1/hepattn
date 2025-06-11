@@ -180,6 +180,13 @@ class HitFilterTask(Task):
         output = outputs[f"{self.hit_name}_logit"]
         target = targets[f"{self.hit_name}_{self.target_field}"].type_as(output)
 
+        # Ensure target has same shape as output by adding batch dimension if needed
+        if output.dim() > target.dim():
+            target = target.view(output.shape)  # Match exact shape
+            print(f"Reshaped target to: {target.shape}")
+
+        print(f"Final shapes - Output: {output.shape}, Target: {target.shape}")
+
         # Calculate the BCE loss with class weighting
         if self.loss_fn == "bce":
             weight = 1 / target.float().mean()
@@ -814,7 +821,6 @@ class FPRegressionTask(Task):
                 if target_key not in targets:
                     raise KeyError(f"Missing target {target_key}")
                 scaled_tgt = self.scaler.scale(tgt)(targets[target_key])
-                # scaled_tgt = torch.nan_to_num(scaled_tgt, nan=0.0, posinf=1e4, neginf=-1e4)
                 label_tensors.append(scaled_tgt.unsqueeze(-1))
             except Exception as e:
                 raise RuntimeError(f"Error processing target {tgt}: {str(e)}")
@@ -851,9 +857,9 @@ class FPRegressionTask(Task):
                     labels[valid_idx],     # [valid_batch, num_features]
                 )
             
-            # # Store per-feature losses
-            # for i, tgt in enumerate(self.target_labels):
-            #     loss_dict[loss_fn][f"{tgt}_loss"] = loss_weight * feature_losses[i]
+            # Store per-feature losses
+            for i, tgt in enumerate(self.target_labels):
+                loss_dict[loss_fn][f"{tgt}_loss"] = loss_weight * feature_losses[i]
                 
             # Store total loss
             loss_dict[loss_fn] = loss_weight * feature_losses.mean()
@@ -869,7 +875,6 @@ class FPRegressionTask(Task):
         labels = []
         for tgt in self.target_labels:
             scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
-            # scaled_tgt = torch.nan_to_num(scaled_tgt, nan=0.0, posinf=1e4, neginf=-1e4)
             labels.append(scaled_tgt.unsqueeze(-1))
         labels = torch.cat(labels, dim=-1)
 
@@ -885,7 +890,6 @@ class FPRegressionTask(Task):
             # Calculate the base costs between all pred-target pairs
             base_costs = cost_weight * cost_fns[cost_fn](preds, labels)
             # Create mask for invalid targets
-            # Create mask for invalid targets - create new tensor
             mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1).clone()
             # Create a new tensor for costs with masked values set to 1e6
             costs = torch.where(
