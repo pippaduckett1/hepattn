@@ -7,6 +7,9 @@ from torch import Tensor, nn
 from hepattn.models.dense import Dense
 from hepattn.models.loss import cost_fns, focal_loss, loss_fns
 from hepattn.utils.scaling import RegressionTargetScaler
+import torch.nn.functional as F
+
+import sys
 
 
 class Task(nn.Module, ABC):
@@ -432,46 +435,46 @@ class RegressionTask(Task):
 
         return loss_dict
 
-    def cost(self, outputs, targets):
+    # def cost(self, outputs, targets):
         
-        # Detach predictions and get the relevant predictions
-        preds = outputs[self.name].detach()
+    #     # Detach predictions and get the relevant predictions
+    #     preds = outputs[self.name].detach()
         
-        # Build labels array just like in loss function
-        labels = []
-        for tgt in self.target_labels:
-            scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
-            labels.append(scaled_tgt.unsqueeze(-1))
-        labels = torch.cat(labels, dim=-1)
+    #     # Build labels array just like in loss function
+    #     labels = []
+    #     for tgt in self.target_labels:
+    #         scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
+    #         labels.append(scaled_tgt.unsqueeze(-1))
+    #     labels = torch.cat(labels, dim=-1)
 
-        # Get valid indices - create a new tensor instead of modifying in place
-        valid_idx = targets[f"{self.output_object}_valid"].clone()
-        valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
-        valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
+    #     # Get valid indices - create a new tensor instead of modifying in place
+    #     valid_idx = targets[f"{self.output_object}_valid"].clone()
+    #     valid_idx = torch.logical_and(valid_idx, ~torch.isnan(labels).all(-1))
+    #     valid_idx = torch.logical_and(valid_idx, ~(labels == 0).all(-1))
 
-        # Initialize cost dictionary
-        cost_dict = {}
+    #     # Initialize cost dictionary
+    #     cost_dict = {}
 
-        for cost_fn, cost_weight in self.costs.items():
-            # Calculate the base costs between all pred-target pairs
-            base_costs = cost_weight * cost_fns[cost_fn](preds, labels)
-            # Create mask for invalid targets
-            # Create mask for invalid targets - create new tensor
-            mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1).clone()
-            # Create a new tensor for costs with masked values set to 1e6
-            costs = torch.where(
-                mask,
-                base_costs,
-                torch.full_like(base_costs, 1e6)
-            )
-            cost_dict[cost_fn] = costs
+    #     for cost_fn, cost_weight in self.costs.items():
+    #         # Calculate the base costs between all pred-target pairs
+    #         base_costs = cost_weight * cost_fns[cost_fn](preds, labels)
+    #         # Create mask for invalid targets
+    #         # Create mask for invalid targets - create new tensor
+    #         mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1).clone()
+    #         # Create a new tensor for costs with masked values set to 1e6
+    #         costs = torch.where(
+    #             mask,
+    #             base_costs,
+    #             torch.full_like(base_costs, 1e6)
+    #         )
+    #         cost_dict[cost_fn] = costs
 
-        # #TODO check if this is correct
-        # # Expand valid_idx to match [batch, pred, true]
-        # mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1)  
-        # cost_dict[self.name][~mask] = 1e6
+    #     # #TODO check if this is correct
+    #     # # Expand valid_idx to match [batch, pred, true]
+    #     # mask = valid_idx.unsqueeze(1).expand(-1, preds.shape[1], -1)  
+    #     # cost_dict[self.name][~mask] = 1e6
         
-        return cost_dict
+    #     return cost_dict
 
     def forward(self, x: dict[str, Tensor]) -> dict[str, Tensor]:
         """Forward pass for regression predictions.
@@ -555,7 +558,37 @@ class RegressionTask(Task):
                 raise RuntimeError(f"Error unscaling feature {tgt}: {str(e)}")
                 
         return unscaled_preds
+
+class HybridPooling(nn.Module):
+    def __init__(self, use_max_only: bool = False):
+        super().__init__()
+        self.use_max_only = use_max_only
+        
+    def forward(self, x):
+        if self.use_max_only:
+            return F.adaptive_max_pool2d(x, (1, 1))
+        max_pool = F.adaptive_max_pool2d(x, (1, 1))
+        avg_pool = F.adaptive_avg_pool2d(x, (1, 1))
+        return torch.cat([avg_pool, max_pool], dim=1)
     
+
+class InputNormalization(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_features)
+    
+    def forward(self, x):
+        # x shape: [batch, channels, seq_len, features]
+        # Permute to [batch, seq_len, channels, features]
+        x = x.permute(0, 2, 1, 3)
+        # Combine channels and features for normalization
+        shape = x.shape
+        x = x.reshape(shape[0], shape[1], -1)
+        # Normalize
+        x = self.norm(x)
+        # Restore shape and permute back
+        x = x.reshape(shape)
+        return x.permute(0, 2, 1, 3)
 
 
 class FPRegressionTaskHitObjRepr(RegressionTask):
@@ -705,11 +738,223 @@ class FPRegressionTaskHitObjRepr(RegressionTask):
 
 
 
+class FPRegressionTaskHitObjCNN(RegressionTask):
+
+    def __init__(
+        self,
+        name: str,
+        target_labels: list[str],
+        input_object: str,
+        output_object: str,
+        scaler: RegressionTargetScaler,
+        losses: dict[str, float],
+        costs: dict[str, float],
+        net: nn.Module | None = None,
+        add_momentum: bool = False,
+        combine_phi: bool = False,
+        max_hits: int = 20,
+        cnn_hidden_dim: int = 64,
+        cnn_out_dim: int = 64,
+        dropout_rate: float = 0.2,
+        num_features: int = 6,
+        use_max_only: bool = False,
+        add_positional_features: bool = False,
+        **kwargs
+    ):
+        """Regression task that uses hit object representations.
+        
+        Parameters are the same as RegressionTask, with additional parameters:
+        combine_phi : bool
+            Whether to combine phi coordinates in the hit representation
+        """
+        super().__init__(
+            name=name,
+            target_labels=target_labels,
+            input_object=input_object,
+            output_object=output_object,
+            scaler=scaler,
+            losses=losses,
+            costs=costs,
+            net=net,
+            add_momentum=add_momentum,
+            combine_phi=combine_phi,
+            **kwargs
+        )
+
+        self.max_hits = max_hits
+        self.cnn_hidden_dim = cnn_hidden_dim
+        self.cnn_out_dim = cnn_out_dim
+        self.use_max_only = use_max_only
+        self.add_positional_features = add_positional_features
+        if add_positional_features:
+            num_features += 1
+        self.num_features = num_features
 
 
+        # CNN for processing hit coordinates
+        # Input shape: [batch * num_tracks, 1, max_hits, num_coords + 1]  # for pos encoding
+        self.hit_cnn = nn.Sequential(
+            # Input normalization
+            InputNormalization(num_features=num_features),  # n coords + pos_encoding
+            
+            # First conv block
+            nn.Conv2d(1, cnn_hidden_dim, kernel_size=(3, 1), padding=(1, 0)),
+            nn.GELU(),
+            nn.LayerNorm([cnn_hidden_dim, max_hits, num_features]),
+            
+            # Second conv block
+            nn.Conv2d(cnn_hidden_dim, cnn_hidden_dim * 2, kernel_size=(3, 1), padding=(1, 0)),
+            nn.GELU(),
+            nn.GroupNorm(num_groups=8, num_channels=cnn_hidden_dim*2),
+            
+            # Pooling
+            HybridPooling(use_max_only=use_max_only),
+            nn.Flatten(),
+        )
 
 
+    def add_positional_features(self, hits: Tensor) -> Tensor:
+        """Add radius and normalized position features to hit coordinates.
+        
+        Parameters
+        ----------
+        hits : Tensor [batch, num_hits, 3]
+            Hit coordinates (x, y, z)
+            
+        Returns
+        -------
+        Tensor [batch, num_hits, 4]
+            Hit coordinates with added normalized position
+        """
+        
+        # Create normalized position encoding
+        batch_size, num_hits = hits.shape[:2]
+        pos_encoding = torch.arange(num_hits, device=hits.device).float()
+        pos_encoding = pos_encoding / (num_hits - 1)  # Normalize to [0, 1]
+        pos_encoding = pos_encoding.view(1, -1, 1).expand(batch_size, -1, -1)
+        
+        # Concatenate original coordinates with r and position encoding
+        return torch.cat([hits, pos_encoding], dim=-1)
 
+
+    def get_hit_embeds_from_logits(self, track_hit_assignment_logits, hit_embed):
+
+        # Convert logits to probabilities once
+        hit_scores = track_hit_assignment_logits.sigmoid()  # [batch, num_queries, num_hits]
+        
+        # Create mask for hits above threshold
+        track_hit_assignment_mask = (hit_scores > 0.1)  # [batch, num_queries, num_hits]
+        num_hits_per_track = track_hit_assignment_mask.sum(dim=-1)  # [batch, num_queries]
+        
+        # Initialize output tensor
+        batch_size, num_queries, _ = track_hit_assignment_logits.shape
+        embeds_shape = self.cnn_hidden_dim if self.use_max_only else 4 * self.cnn_hidden_dim
+        track_hit_embeds = torch.zeros(batch_size, num_queries, embeds_shape, device=hit_embed.device)
+
+        # For each track that has hits assigned, gather and do weighted average of its hit embeddings
+        for b in range(batch_size):
+            for q in range(num_queries):
+                if num_hits_per_track[b, q] > 0:
+                    # Get indices of hits above threshold
+                    hit_indices = torch.where(track_hit_assignment_mask[b, q])[0]
+                    # Get scores for valid hits
+                    valid_hit_scores = track_hit_assignment_logits[b, q, hit_indices]
+
+                    print("-------------------------")
+                    print("hit scores")
+                    print(valid_hit_scores)
+
+                    print("-------------------------")
+                    print("num hits: ", len(hit_indices))
+
+                     # If we have more hits than max_hits, take top scoring ones
+                    if len(hit_indices) > self.max_hits:
+                        # Get indices of top scoring hits
+                        _, top_k_indices = torch.topk(valid_hit_scores, k=self.max_hits)
+                        selected_indices = hit_indices[top_k_indices]
+                    else:
+                        selected_indices = hit_indices
+
+                    # Get embeddings for selected hits
+                    selected_hits = hit_embed[b, selected_indices]  # [num_selected, embed_dim]
+
+                    # Sort by radius if available (assuming last dimension is radius)
+                    if selected_hits.size(1) > 0:  # Check if we have any hits
+                        r = selected_hits[:, -1]  # Get radius values
+                        _, r_indices = torch.sort(r)
+                        selected_hits = selected_hits[r_indices]
+
+                    #TODO Have a look at how many hits each track has
+
+                    # Add positional features if needed
+                    if hasattr(self, 'add_positional_features') and self.add_positional_features:
+                        selected_hits = self.add_positional_features(selected_hits.unsqueeze(0))[0]
+                    
+                    # Pad if necessary
+                    if len(selected_hits) < self.max_hits:
+                        padding = torch.zeros(
+                            self.max_hits - len(selected_hits),
+                            selected_hits.size(1),
+                            device=selected_hits.device
+                        )
+                        padded_hits = torch.cat([selected_hits, padding], dim=0)
+                    else:
+                        padded_hits = selected_hits
+
+                    # Add batch and channel dimensions for CNN
+                    cnn_input = padded_hits.unsqueeze(0).unsqueeze(0)  # [1, 1, max_hits, num_coords]
+                    
+                    # Apply CNN
+                    hit_features = self.hit_cnn(cnn_input)  # [1, cnn_hidden_dim * 2]
+
+                    track_hit_embeds[b, q] = hit_features.squeeze(0)
+
+        return track_hit_embeds
+
+
+    def forward(self, x: dict[str, Tensor], track_hit_valid_mask: dict[str, Tensor] | None = None, track_valid_mask: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
+        """Forward pass for regression predictions using hit object representations.
+        
+        Parameters
+        ----------
+        x : dict[str, Tensor]
+            Dictionary containing input tensors. Must contain:
+            - query_embed: [batch_size, num_queries, embedding_dim]
+            - hit_embed: [batch_size, num_hits, embedding_dim]
+            
+        Returns
+        -------
+        dict[str, Tensor]
+            Dictionary containing predictions with key self.name and shape
+            [batch_size, num_queries, num_features]
+        """
+        query_embed = x["query_embed"]
+        hit_embed = x["hit_coords"]
+
+        if track_hit_valid_mask is None:
+            raise ValueError("track_hit_valid_mask is required")
+        
+        track_hit_assignment_logits = track_hit_valid_mask["track_hit_valid"]  # [batch, num_queries, num_hits]
+        assert track_hit_assignment_logits.dtype in [torch.float32, torch.float64, torch.bfloat16], f"Expected float mask, got {track_hit_assignment_logits.dtype}"
+
+        track_hit_embeds = self.get_hit_embeds_from_logits(track_hit_assignment_logits, hit_embed)
+
+        # Combine query embeddings with hit embeddings
+        combined_embed = torch.cat([query_embed, track_hit_embeds], dim=-1)
+        
+        # Get predictions from network
+        preds = self.net(combined_embed)
+        
+        # Ensure predictions have expected shape
+        expected_features = len(self.target_labels) - (1 if self.add_momentum else 0)
+        assert preds.shape[-1] == expected_features, \
+            f"Expected {expected_features} output features but got {preds.shape[-1]}"
+        
+        # Add momentum if requested
+        if self.add_momentum:
+            preds = self.add_momentum_to_preds(preds)
+            
+        return {self.name: preds}
 
 
 

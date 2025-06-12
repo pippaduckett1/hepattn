@@ -107,7 +107,9 @@ class MaskFormer(nn.Module):
         x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)
         x["query_valid"] = torch.full((batch_size, self.num_queries), True)
 
-        x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in ["x", "y", "z"]], dim=-1)  # [batch, hits, 3]
+        hit_coords = ["x", "y", "z", "sinphi", "cosphi", "r"]
+        x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in hit_coords], dim=-1)  # [batch, hits, 3]
+        assert hit_coords[-1] == "r"
 
         # Pass encoded inputs through decoder to produce outputs
         outputs = {}
@@ -120,9 +122,12 @@ class MaskFormer(nn.Module):
             for task in self.tasks:
                 # Get the outputs of the task given the current embeddings and record them
                 if "fp_regression" in task.name:
-                    task_outputs = task(x, {"track_hit_valid": attn_mask})
-                else:
-                    task_outputs = task(x)
+                    continue
+                #     task_outputs = task(x, {"track_hit_valid": attn_mask})
+                # else:
+                #     task_outputs = task(x)
+
+                task_outputs = task(x)
 
                 outputs[f"layer_{layer_index}"][task.name] = task_outputs
 
@@ -177,9 +182,8 @@ class MaskFormer(nn.Module):
 
         for task in self.tasks:
             if "fp_regression" in task.name:
-                track_hit_valid_logits = outputs["final"]['track_hit_valid']['track_hit_logit']
-                outputs["final"][task.name] = task(x, track_hit_valid_logits, hit_valid_masks)
-                # outputs["final"][task.name] = task(x, track_hit_valid_masks, hit_valid_masks)
+                track_hit_valid_logits = outputs[f"layer_{layer_index}"]['track_hit_valid']['track_hit_logit']
+                outputs["final"][task.name] = task(x, {"track_hit_valid": track_hit_valid_logits})
             else:
                 outputs["final"][task.name] = task(x)
                 track_hit_valid_masks[task.name] = task.attn_mask(outputs["final"][task.name])
@@ -202,6 +206,8 @@ class MaskFormer(nn.Module):
             preds[layer_name] = {}
 
             for task in self.tasks:
+                if ("fp_regression" in task.name) and (layer_name!="final"):
+                    continue
                 preds[layer_name][task.name] = task.predict(layer_outputs[task.name])
 
         return preds
@@ -226,9 +232,9 @@ class MaskFormer(nn.Module):
             layer_costs = None
             # Get the cost contribution from each of the tasks
             for task in self.tasks:
-                # Only use the cost from the final set of predictions
-                if (task.name == "fp_regression") and (layer_name!="final"):
+                if ("fp_regression" in task.name):
                     continue
+                # Only use the cost from the final set of predictions
                 task_costs = task.cost(layer_outputs[task.name], targets)
 
                 # Add the cost on to our running cost total, otherwise initialise a running cost matrix
@@ -243,11 +249,15 @@ class MaskFormer(nn.Module):
         # Permute the outputs for each output in each layer
         for layer_name in outputs:
             # Get the indicies that can permute the predictions to yield their optimal matching
+            print(layer_name)
+            print(costs[layer_name])
             pred_idxs = self.matcher(costs[layer_name])
             batch_idxs = torch.arange(costs[layer_name].shape[0]).unsqueeze(1).expand(-1, self.num_queries)
 
             # Apply the permutation in place
             for task in self.tasks:
+                if ("fp_regression" in task.name) and (layer_name!="final"):
+                    continue
                 for output in task.outputs:
                     outputs[layer_name][task.name][output] = outputs[layer_name][task.name][output][batch_idxs, pred_idxs]
 
@@ -256,7 +266,7 @@ class MaskFormer(nn.Module):
         for layer_name in outputs:
             losses[layer_name] = {}
             for task in self.tasks:
-                if (task.name == "fp_regression") and (layer_name!="final"):
+                if ("fp_regression" in task.name) and (layer_name!="final"):
                     continue
                 losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
 
