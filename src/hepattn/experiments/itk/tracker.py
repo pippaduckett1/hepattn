@@ -2,6 +2,8 @@ from torch import nn
 
 from hepattn.models.wrapper import ModelWrapper
 
+from typing import List
+
 
 class ITkTracker(ModelWrapper):
     def __init__(
@@ -11,19 +13,19 @@ class ITkTracker(ModelWrapper):
         lrs_config: dict,
         optimizer: str = "AdamW",
         mtl: bool = False,
+        hits: List = ["pixel", "strip"],
     ):
         super().__init__(name, model, lrs_config, optimizer, mtl)
+        self.hits = hits
 
     def log_custom_metrics(self, preds, targets, stage):
         # Just log predictions from the final layer
         preds = preds["final"]
 
-        hits = ["pixel", "strip"]
-
         pred_valid = preds["track_valid"]["track_valid"]
         true_valid = targets["particle_valid"]
 
-        for hit in hits:
+        for hit in self.hits:
             # Set the masks of any track slots that are not used as null
             pred_hit_masks = preds[f"track_{hit}_assignment"][f"track_{hit}_valid"] & pred_valid.unsqueeze(-1)
             true_hit_masks = targets[f"particle_{hit}_valid"]

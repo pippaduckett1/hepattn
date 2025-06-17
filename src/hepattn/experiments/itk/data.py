@@ -200,10 +200,14 @@ class ITkDataset(Dataset):
             targets[f"{hit}_on_valid_particle"] = hits[hit]["on_valid_particle"].to_numpy(dtype=bool)
 
         # Now build and add the masks
-        particle_ids = particles["particle_id"].to_numpy(dtype=np.int64)
+        # particle_ids = particles["particle_id"].to_numpy(dtype=np.int64)
+        particle_ids = torch.from_numpy(particles["particle_id"].to_numpy(dtype=np.int64))
         for hit in self.inputs:
-            hit_particle_ids = hits[hit]["particle_id"].to_numpy(dtype=np.int64)
-            targets[f"particle_{hit}_valid"] = particle_ids[:, None] == hit_particle_ids[None, :]
+            # hit_particle_ids = hits[hit]["particle_id"].to_numpy(dtype=np.int64)
+            # targets[f"particle_{hit}_valid"] = particle_ids[:, None] == hit_particle_ids[None, :]
+
+            hit_particle_ids = torch.from_numpy(hits[hit]["particle_id"].to_numpy(dtype=np.int64))
+            targets[f"particle_{hit}_valid"] = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
 
         # Now the particle fields
         if "particle" in self.targets:
@@ -253,11 +257,20 @@ class ITkDataset(Dataset):
                     target_field = pad_to_size(target_field, target_shapes[target_name], False).bool()
                 targets_out[f"{target_name}_{field}"] = target_field.unsqueeze(0)
 
+
         # Now the metadata
         targets_out["sample_id"] = torch.tensor([targets["sample_id"]], dtype=torch.int64)
 
+        # Handle on_valid_particle tensors with proper padding
         for hit in self.inputs:
-            targets_out[f"{hit}_on_valid_particle"] = targets[f"{hit}_on_valid_particle"]
+            # targets_out[f"{hit}_on_valid_particle"] = targets[f"{hit}_on_valid_particle"]
+            target_particle_hit_valid = targets[f"particle_{hit}_valid"]
+            # Remove batch dimension for padding
+            target_particle_hit_valid = target_particle_hit_valid.squeeze(0)
+            # Pad to match [max_num_particles, num_hits]
+            target_particle_hit_valid = pad_to_size(target_particle_hit_valid, target_shapes[f"particle_{hit}"], False)
+            # Add batch dimension back
+            targets_out[f"particle_{hit}_valid"] = target_particle_hit_valid.unsqueeze(0)
 
         return inputs_out, targets_out
 
