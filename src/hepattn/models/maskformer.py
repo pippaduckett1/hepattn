@@ -107,9 +107,16 @@ class MaskFormer(nn.Module):
         x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)
         x["query_valid"] = torch.full((batch_size, self.num_queries), True)
 
-        hit_coords = ["x", "y", "z", "sinphi", "cosphi", "r"]
-        x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in hit_coords], dim=-1)  # [batch, hits, 3]
-        assert hit_coords[-1] == "r"
+        has_fp_regression = any("fp_regression" in task.name for task in self.tasks)
+        if has_fp_regression:
+            hit_coords = ["x", "y", "z"]
+            if "sinphi" in inputs.keys():
+                hit_coords+= ["sinphi", "cosphi", "r"]
+            for coord in hit_coords:
+                assert f"hit_{coord}" in inputs, f"Required hit coordinate 'hit_{coord}' not found in inputs for regression task"
+            x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in hit_coords], dim=-1)  # [batch, hits, 3]
+            if any("cnn" in task.name for task in self.tasks):
+                assert hit_coords[-1] == "r"
 
         # Pass encoded inputs through decoder to produce outputs
         outputs = {}
@@ -249,8 +256,6 @@ class MaskFormer(nn.Module):
         # Permute the outputs for each output in each layer
         for layer_name in outputs:
             # Get the indicies that can permute the predictions to yield their optimal matching
-            print(layer_name)
-            print(costs[layer_name])
             pred_idxs = self.matcher(costs[layer_name])
             batch_idxs = torch.arange(costs[layer_name].shape[0]).unsqueeze(1).expand(-1, self.num_queries)
 
