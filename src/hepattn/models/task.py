@@ -280,10 +280,6 @@ class ObjectHitMaskTask(Task):
         output = outputs[self.output_object_hit + "_logit"].detach()
         target = targets[self.target_object_hit + "_valid"].type_as(output)
 
-        print(output.shape)
-        print(target.shape)
-
-
         costs = {}
         for cost_fn, cost_weight in self.costs.items():
             costs[cost_fn] = cost_weight * cost_fns[cost_fn](output, target)

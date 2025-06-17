@@ -110,6 +110,8 @@ class TrackMLDataset(Dataset):
         particle_ids = torch.cat([particle_ids, -999 * torch.ones(self.event_max_num_particles - len(particle_ids))])
         hit_particle_ids = torch.from_numpy(hits["particle_id"].values)
 
+        # inputs['particle_id'] = hits[hit]['particle_id']
+
         # Create the mask targets
         targets["particle_hit_valid"] = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
 
@@ -148,6 +150,8 @@ class TrackMLDataset(Dataset):
         hits["s"] = np.sqrt(hits["x"] ** 2 + hits["y"] ** 2 + hits["z"] ** 2)
         hits["theta"] = np.arccos(hits["z"] / hits["s"])
         hits["phi"] = np.arctan2(hits["y"], hits["x"])
+        hits["sinphi"] = np.sin(hits["phi"])
+        hits["cosphi"] = np.cos(hits["phi"])
         hits["eta"] = -np.log(np.tan(hits["theta"] / 2))
         hits["u"] = hits["x"] / (hits["x"] ** 2 + hits["y"] ** 2)
         hits["v"] = hits["y"] / (hits["x"] ** 2 + hits["y"] ** 2)
