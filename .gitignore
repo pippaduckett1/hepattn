@@ -204,3 +204,4 @@ pytest-temp
 
 # NFS
 *.nfs*
+*/old_eval/*

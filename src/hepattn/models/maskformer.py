@@ -107,9 +107,15 @@ class MaskFormer(nn.Module):
         x["query_embed"] = self.query_initial.expand(batch_size, -1, -1)
         x["query_valid"] = torch.full((batch_size, self.num_queries), True)
 
-        hit_coords = ["x", "y", "z", "sinphi", "cosphi", "r"]
-        x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in hit_coords], dim=-1)  # [batch, hits, 3]
-        assert hit_coords[-1] == "r"
+        # Only include hit coordinates if any task includes fp_regression in its name
+        has_fp_regression = any("fp_regression" in task.name for task in self.tasks)
+        if has_fp_regression:
+            hit_coords = ["x", "y", "z", "sinphi", "cosphi", "r"]
+            # Check that all required hit coordinate keys exist in inputs
+            for coord in hit_coords:
+                assert f"hit_{coord}" in inputs, f"Required hit coordinate 'hit_{coord}' not found in inputs for regression task"
+            x["hit_coords"] = torch.stack([inputs["hit_" + input_name] for input_name in hit_coords], dim=-1)  # [batch, hits, 3]
+            assert hit_coords[-1] == "r"
 
         # Pass encoded inputs through decoder to produce outputs
         outputs = {}
