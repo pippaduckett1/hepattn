@@ -9,6 +9,11 @@ from hepattn.models.loss import cost_fns, focal_loss, loss_fns
 from hepattn.utils.scaling import RegressionTargetScaler
 import torch.nn.functional as F
 
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from datetime import datetime
+
 import sys
 
 
@@ -278,8 +283,6 @@ class ObjectHitMaskTask(Task):
         costs = {}
         for cost_fn, cost_weight in self.costs.items():
             costs[cost_fn] = cost_weight * cost_fns[cost_fn](output, target)
-
-            # Set the costs of invalid objects to be (basically) inf
             costs[cost_fn][~targets[self.target_object + "_valid"].unsqueeze(-2).expand_as(costs[cost_fn])] = 1e6
         return costs
 
@@ -759,6 +762,7 @@ class FPRegressionTaskHitObjCNN(RegressionTask):
         num_features: int = 6,
         use_max_only: bool = False,
         add_positional_features: bool = False,
+        plot_dir: str = "plots/",
         **kwargs
     ):
         """Regression task that uses hit object representations.
@@ -789,7 +793,11 @@ class FPRegressionTaskHitObjCNN(RegressionTask):
         if add_positional_features:
             num_features += 1
         self.num_features = num_features
+        self.plot_dir = plot_dir
+        self.step = 0
 
+        # Create plot directory if it doesn't exist
+        os.makedirs(plot_dir, exist_ok=True)
 
         # CNN for processing hit coordinates
         # Input shape: [batch * num_tracks, 1, max_hits, num_coords + 1]  # for pos encoding
@@ -836,6 +844,55 @@ class FPRegressionTaskHitObjCNN(RegressionTask):
         # Concatenate original coordinates with r and position encoding
         return torch.cat([hits, pos_encoding], dim=-1)
 
+    def plot_hit_groups(self, batch_idx: int, hit_coords: torch.Tensor, hit_groups: list[torch.Tensor], scores: list[torch.Tensor]):
+        """Plot hit coordinates for each group in different colors.
+        
+        Parameters
+        ----------
+        batch_idx : int
+            Index of the batch to plot
+        hit_coords : torch.Tensor
+            Full tensor of hit coordinates [num_hits, num_features]
+        hit_groups : list[torch.Tensor] 
+            List of tensors containing indices for each group's hits
+        scores : list[torch.Tensor]
+            List of tensors containing scores for each group's hits
+        """
+        plt.figure(figsize=(10, 10))
+        
+        # Generate a color for each group
+        colors = plt.cm.rainbow(np.linspace(0, 1, len(hit_groups)))
+        
+        # Plot each group with a different color
+        for group_idx, (group_indices, group_scores) in enumerate(zip(hit_groups, scores)):
+            if len(group_indices) == 0:
+                continue
+                
+            # Get coordinates for this group
+            group_coords = hit_coords[group_indices]
+            x_coords = group_coords[:, 0].cpu().numpy()
+            y_coords = group_coords[:, 1].cpu().numpy()
+            
+            # Convert scores to numpy and normalize for alpha values
+            alpha_values = group_scores.to(torch.float32).sigmoid().cpu().numpy()
+
+            
+            # Plot points with alpha values based on scores
+            plt.scatter(x_coords, y_coords, c=[colors[group_idx]], alpha=alpha_values, 
+                       label=f'Group {group_idx}')
+        
+        plt.xlabel('x coordinate')
+        plt.ylabel('y coordinate')
+        plt.title(f'Hit Groups - Event {batch_idx}, Step {self.step}')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save the plot
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        plt.savefig(os.path.join(self.plot_dir, f'hits_event{batch_idx}_step{self.step}_{timestamp}.png'))
+        plt.close()
+        
+        self.step += 1
 
     def get_hit_embeds_from_logits(self, track_hit_assignment_logits, hit_embed):
 
@@ -851,8 +908,13 @@ class FPRegressionTaskHitObjCNN(RegressionTask):
         embeds_shape = self.cnn_hidden_dim if self.use_max_only else 4 * self.cnn_hidden_dim
         track_hit_embeds = torch.zeros(batch_size, num_queries, embeds_shape, device=hit_embed.device)
 
+        plot_batch_idx = torch.randint(0, batch_size, (1,)).item()
+
         # For each track that has hits assigned, gather and do weighted average of its hit embeddings
         for b in range(batch_size):
+            do_plot = True if (b==plot_batch_idx) else False
+            hit_groups = []
+            hit_scores = []
             for q in range(num_queries):
                 if num_hits_per_track[b, q] > 0:
                     # Get indices of hits above threshold
@@ -860,20 +922,19 @@ class FPRegressionTaskHitObjCNN(RegressionTask):
                     # Get scores for valid hits
                     valid_hit_scores = track_hit_assignment_logits[b, q, hit_indices]
 
-                    print("-------------------------")
-                    print("hit scores")
-                    print(valid_hit_scores)
-
-                    print("-------------------------")
-                    print("num hits: ", len(hit_indices))
-
                      # If we have more hits than max_hits, take top scoring ones
                     if len(hit_indices) > self.max_hits:
                         # Get indices of top scoring hits
                         _, top_k_indices = torch.topk(valid_hit_scores, k=self.max_hits)
                         selected_indices = hit_indices[top_k_indices]
+                        valid_hit_scores = valid_hit_scores[top_k_indices]
                     else:
                         selected_indices = hit_indices
+
+                    if do_plot:
+                        # Store for visualization
+                        hit_groups.append(selected_indices)
+                        hit_scores.append(valid_hit_scores)
 
                     # Get embeddings for selected hits
                     selected_hits = hit_embed[b, selected_indices]  # [num_selected, embed_dim]
@@ -908,6 +969,9 @@ class FPRegressionTaskHitObjCNN(RegressionTask):
                     hit_features = self.hit_cnn(cnn_input)  # [1, cnn_hidden_dim * 2]
 
                     track_hit_embeds[b, q] = hit_features.squeeze(0)
+                        # Plot hits for this batch
+            if (len(hit_groups) > 0) and (do_plot):
+                self.plot_hit_groups(b, hit_embed[b], hit_groups, hit_scores)
 
         return track_hit_embeds
 
@@ -1102,9 +1166,9 @@ class FPRegressionTask(Task):
                     labels[valid_idx],     # [valid_batch, num_features]
                 )
             
-            # Store per-feature losses
-            for i, tgt in enumerate(self.target_labels):
-                loss_dict[loss_fn][f"{tgt}_loss"] = loss_weight * feature_losses[i]
+            # # Store per-feature losses
+            # for i, tgt in enumerate(self.target_labels):
+            #     loss_dict[loss_fn][f"{tgt}_loss"] = loss_weight * feature_losses[i]
                 
             # Store total loss
             loss_dict[loss_fn] = loss_weight * feature_losses.mean()
@@ -1551,7 +1615,6 @@ class FPRegressionTaskHitOnly(FPRegressionTask):
         # Build labels array just like in loss function
         labels = []
         for tgt in self.target_labels:
-            print(targets.keys())
             scaled_tgt = self.scaler.scale(tgt)(targets[f"{self.output_object}_{tgt}"])
             scaled_tgt = torch.nan_to_num(scaled_tgt, nan=0.0, posinf=1e4, neginf=-1e4)
             labels.append(scaled_tgt.unsqueeze(-1))
@@ -1651,13 +1714,8 @@ class FPRegressionTaskHitOnly(FPRegressionTask):
                         # Store coordinates - the rest will remain as zeros for padding
                         track_hit_coords[b, q, :num_hits_to_use * 3] = flattened_coords
 
-            print(batch_size)
-            print(num_queries)
-            print(self.max_hits *3)
-
             return track_hit_coords
         
-        print(track_hit_assignment)
         if isinstance(track_hit_assignment, torch.Tensor):
             print("is tensor...")
         else:
@@ -1666,8 +1724,6 @@ class FPRegressionTaskHitOnly(FPRegressionTask):
         
         # Get hit coordinates
         track_hit_coords = get_hit_coords(track_hit_assignment, input_coords)
-
-        print(track_hit_coords.shape)
 
         embed = torch.cat([input_embed, track_hit_coords], dim=-1)
 
@@ -1678,7 +1734,6 @@ class FPRegressionTaskHitOnly(FPRegressionTask):
         assert input_embed.dim() == 3, f"Expected 3D input tensor, got shape {input_embed.shape}"
         
         # Get predictions from network
-        print(track_hit_coords.shape)
         preds = self.net(embed)
         # preds = self.net(input_embed)
         

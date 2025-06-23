@@ -204,34 +204,14 @@ class ITkDataset(Dataset):
             targets[f"{hit}_on_valid_particle"] = torch.from_numpy(hits[hit]["on_valid_particle"].to_numpy(dtype=bool)).unsqueeze(0)
 
         # Now build and add the masks
+        # particle_ids = particles["particle_id"].to_numpy(dtype=np.int64)
         particle_ids = torch.from_numpy(particles["particle_id"].to_numpy(dtype=np.int64))
         for hit in self.inputs:
+            # hit_particle_ids = hits[hit]["particle_id"].to_numpy(dtype=np.int64)
+            # targets[f"particle_{hit}_valid"] = particle_ids[:, None] == hit_particle_ids[None, :]
+
             hit_particle_ids = torch.from_numpy(hits[hit]["particle_id"].to_numpy(dtype=np.int64))
-            mask = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
-            targets[f"particle_{hit}_valid"] = mask
-            
-            # Debug checks
-            print(f"\nDebug for {hit} hits:")
-            print(f"Number of particles: {len(particle_ids)}")
-            print(f"Number of hits: {len(hit_particle_ids)}")
-            print(f"Mask shape: {mask.shape}")
-            print(f"Number of True values in mask: {mask.sum().item()}")
-            
-            # Check that each hit is assigned to at most one particle
-            hits_per_particle = mask.sum(dim=-1)  # Sum over hits dimension
-            print(f"Max hits per particle: {hits_per_particle.max().item()}")
-            print(f"Min hits per particle: {hits_per_particle.min().item()}")
-            
-            # Check that each particle has at least min_hits
-            particles_with_min_hits = (hits_per_particle >= self.particle_min_num_hits[hit]).sum().item()
-            print(f"Particles with >= {self.particle_min_num_hits[hit]} hits: {particles_with_min_hits}")
-            
-            # Verify that the mask matches the particle IDs
-            for i, pid in enumerate(particle_ids):
-                hit_indices = torch.where(mask[0, i])[0]  # Get indices of hits for this particle
-                if len(hit_indices) > 0:
-                    hit_pids = hit_particle_ids[hit_indices]
-                    assert torch.all(hit_pids == pid), f"Particle {pid} has hits with wrong particle IDs"
+            targets[f"particle_{hit}_valid"] = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
 
         # Now the particle fields
         if "particle" in self.targets:
@@ -281,25 +261,18 @@ class ITkDataset(Dataset):
                     target_field = pad_to_size(target_field, target_shapes[target_name], False).bool()
                 targets_out[f"{target_name}_{field}"] = target_field.unsqueeze(0)
 
+
         # Now the metadata
         targets_out["sample_id"] = torch.tensor([targets["sample_id"]], dtype=torch.int64)
 
         # Handle on_valid_particle tensors with proper padding
-        # We want a mask that shows which hits belong to which particles
-        # The shape should be [batch, num_particles, num_hits]
-        # Each element [b,i,j] should be True if hit j belongs to particle i in batch b
         for hit in self.inputs:
-            valid_particle = torch.from_numpy(targets[f"{hit}_on_valid_particle"]).bool()
-            # Pad to match the number of hits in the event
-            valid_particle = pad_to_size(valid_particle, target_shapes[hit], False)
-            targets_out[f"{hit}_on_valid_particle"] = valid_particle.unsqueeze(0)
-
-            # Get the particle-hit mask and pad it to match expected dimensions
+            # targets_out[f"{hit}_on_valid_particle"] = targets[f"{hit}_on_valid_particle"]
             target_particle_hit_valid = targets[f"particle_{hit}_valid"]
             # Remove batch dimension for padding
             target_particle_hit_valid = target_particle_hit_valid.squeeze(0)
             # Pad to match [max_num_particles, num_hits]
-            target_particle_hit_valid = pad_to_size(target_particle_hit_valid, (self.event_max_num_particles, -1), False)
+            target_particle_hit_valid = pad_to_size(target_particle_hit_valid, target_shapes[f"particle_{hit}"], False)
             # Add batch dimension back
             targets_out[f"particle_{hit}_valid"] = target_particle_hit_valid.unsqueeze(0)
 
