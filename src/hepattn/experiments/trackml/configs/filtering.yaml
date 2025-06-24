@@ -2,9 +2,9 @@ seed_everything: 42
 name: HC-v3
 
 data:
-  train_dir: /share/rcifdata/maxhart/data/trackml/prepped/train/
-  val_dir: /share/rcifdata/maxhart/data/trackml/prepped/val/
-  test_dir: /share/rcifdata/maxhart/data/trackml/prepped/test/
+  train_dir: /share/rcifdata/pduckett/hepattn/data/trackml/prepped/train/
+  val_dir: /share/rcifdata/pduckett/hepattn/data/trackml/prepped/val/
+  test_dir: /share/rcifdata/pduckett/hepattn/data/trackml/prepped/test/
 
   num_workers: 10
   num_train: -1
@@ -163,7 +163,7 @@ model:
             - class_path: hepattn.models.task.HitFilterTask
               init_args:
                 name: hit_filter
-                input_object: hit
+                hit_name: hit
                 target_field: on_valid_particle
                 dim: *dim
                 threshold: 0.1
