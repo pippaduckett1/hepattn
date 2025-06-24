@@ -26,6 +26,7 @@ class TrackMLDataset(Dataset):
         particle_min_num_hits=3,
         event_max_num_particles=1000,
         hit_eval_path: str | None = None,
+        noise_frac: float = 0
     ):
         super().__init__()
 
@@ -57,6 +58,7 @@ class TrackMLDataset(Dataset):
         self.num_events = num_events
         self.event_names = event_names[:num_events]
         self.sample_ids = [int(name.removeprefix("event")) for name in self.event_names]
+        self.noise_frac = noise_frac
 
         # Setup hit eval file if specified
         if self.hit_eval_path:
@@ -182,7 +184,14 @@ class TrackMLDataset(Dataset):
                 hit_filter_pred = hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/hit_on_valid_particle"][0]
                 hits = hits[hit_filter_pred]
 
-        # TODO: Add back truth based hit filtering
+        # truth based hit filtering
+        else:
+            valid_idx = hits.particle_id.isin(particles.particle_id) | (hits.particle_id == 0)
+            extra_noise = hits[~valid_idx]
+            hits = hits[valid_idx]
+            if self.noise_frac:
+                extra_noise.loc[:, "tgt_pid"] = 0
+                hits = pd.concat([hits, extra_noise.sample(frac=self.noise_frac)])
 
         # Sanity checks
         assert len(particles) != 0, "No particles remaining - loosen selection!"

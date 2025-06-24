@@ -2,13 +2,13 @@ seed_everything: 42
 name: TRK-v0-dice-focal-noce
 
 data:
-  train_dir: /share/rcifdata/maxhart/data/trackml/prepped/train/
-  val_dir: /share/rcifdata/maxhart/data/trackml/prepped/val/
-  test_dir: /share/rcifdata/maxhart/data/trackml/prepped/test/
+  train_dir: /share/rcifdata/pduckett/hepattn/data/trackml/prepped/train/
+  val_dir: /share/rcifdata/pduckett/hepattn/data/trackml/prepped/val/
+  test_dir: /share/rcifdata/pduckett/hepattn/data/trackml/prepped/test/
 
-  hit_eval_train: /share/rcifdata/svanstroud/hepattn/src/hepattn/experiments/trackml/logs/HC-v3_20250612-T220925/ckpts/epoch=015-val_loss=0.19298_train_eval.h5
-  hit_eval_val: /share/rcifdata/svanstroud/hepattn/src/hepattn/experiments/trackml/logs/HC-v3_20250612-T220925/ckpts/epoch=015-val_loss=0.19298_val_eval.h5
-  hit_eval_test: /share/rcifdata/svanstroud/hepattn/src/hepattn/experiments/trackml/logs/HC-v3_20250612-T220925/ckpts/epoch=015-val_loss=0.19298_test_eval.h5
+  # hit_eval_train: /share/rcifdata/pduckett/hepattn/src/hepattn/experiments/trackml/logs/ec_eta4_20250529-T114101/ckpts/epoch=013-val_loss=0.20711_train_eval.h5
+  # hit_eval_val: /share/rcifdata/svanstroud/hepattn/src/hepattn/experiments/trackml/logs/HC-v3_20250612-T220925/ckpts/epoch=015-val_loss=0.19298_val_eval.h5
+  # hit_eval_test: /share/rcifdata/svanstroud/hepattn/src/hepattn/experiments/trackml/logs/HC-v3_20250612-T220925/ckpts/epoch=015-val_loss=0.19298_test_eval.h5
 
   num_workers: 10
   num_train: -1
@@ -183,7 +183,7 @@ model:
             - class_path: hepattn.models.task.ObjectValidTask
               init_args:
                 name: track_valid
-                input_object: query
+                hit_name: query
                 output_object: track
                 target_object: particle
                 losses:
@@ -196,7 +196,7 @@ model:
               init_args:
                 name: track_hit_valid
                 input_hit: hit
-                input_object: query
+                hit_name: query
                 output_object: track
                 target_object: particle
                 losses:
