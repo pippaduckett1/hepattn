@@ -6,6 +6,7 @@ from torch import nn
 from hepattn.experiments.trackml.data import TrackMLDataModule
 from hepattn.models.wrapper import ModelWrapper
 from hepattn.utils.cli import CLI
+from hepattn.models.gpu_memory_tracker import GPUMemoryTracker
 
 
 class TrackMLTracker(ModelWrapper):
@@ -72,12 +73,25 @@ class TrackMLTracker(ModelWrapper):
 
 
 def main(args: ArgsType = None) -> None:
-    CLI(
-        model_class=TrackMLTracker,
-        datamodule_class=TrackMLDataModule,
-        args=args,
-        parser_kwargs={"default_env": True},
-    )
+
+    memory_tracker = GPUMemoryTracker()
+    
+    print("Starting TrackML experiment with GPU memory tracking...")
+    
+    with memory_tracker.track("trackml_training"):
+        CLI(
+            model_class=TrackMLTracker,
+            datamodule_class=TrackMLDataModule,
+            args=args,
+            parser_kwargs={"default_env": True},
+        )
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE - GPU MEMORY SUMMARY")
+    print("="*60)
+    print(memory_tracker.get_summary())
+    
+    memory_tracker.save_results("trackml_experiment_memory.json")
 
 
 if __name__ == "__main__":

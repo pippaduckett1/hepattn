@@ -7,6 +7,8 @@ from torch import Tensor, nn
 from hepattn.models.dense import Dense
 from hepattn.models.loss import cost_fns, focal_loss, loss_fns
 
+import time
+
 # Pick a value that is safe for float16
 COST_PAD_VALUE = 1e4
 
@@ -286,7 +288,12 @@ class ObjectHitMaskTask(Task):
 
         losses = {}
         for loss_fn, loss_weight in self.losses.items():
+            # print("----------------------LOSS FUNCTION--------------------")
+            # print(loss_fn)
+            # t1 = time.time()
             loss = loss_fns[loss_fn](output, target, mask=object_hit_mask, weight=weight)
+            # t2 = time.time()
+            # print("time: ", t2-t1)
             losses[loss_fn] = loss_weight * loss
         return losses
 
