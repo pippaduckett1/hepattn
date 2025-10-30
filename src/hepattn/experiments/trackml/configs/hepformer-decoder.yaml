@@ -122,6 +122,9 @@ model:
   model:
     class_path: hepattn.models.maskformer.MaskFormer
     init_args:
+      # sorter:
+        # class_path: hepattn.utils.sorter.Sorter
+        # init_args:
       input_sort_field: phi
       dim: &dim 256
       loss_config:

@@ -46,14 +46,33 @@ class PredictionWriter(Callback):
         split = Path(self.dataset.dirpath).name
         return Path(self.trainer.ckpt_dir / f"{self.trainer.ckpt_name}_{split}_eval.h5")
 
+    # def on_test_batch_end(self, trainer, pl_module, test_step_outputs, batch, batch_idx):
+    #     inputs, targets = batch
+    #     outputs, preds, losses = test_step_outputs
+
+    #     # handle batched case
+    #     if "sample_id" in targets:
+    #         # Get all of the sample IDs in the batch, this is what will be used to retrieve the samples
+    #         sample_ids = targets["sample_id"]
+
+    #         # Iterate through all of the samples in the batch
+    #         for idx, sample_id in enumerate(sample_ids):
+    #             self.write_sample(sample_id, inputs, targets, outputs, preds, losses, idx)
+
+    #     # handle unbatched case
+    #     else:
+    #         self.write_sample(batch_idx, inputs, targets, outputs, preds, losses, 0)
+
     def on_test_batch_end(self, trainer, pl_module, test_step_outputs, batch, batch_idx):
         inputs, targets = batch
-        outputs, preds, losses = test_step_outputs
-
+        preds = test_step_outputs
+        losses = {}
         # handle batched case
         if "sample_id" in targets:
             # Get all of the sample IDs in the batch, this is what will be used to retrieve the samples
             sample_ids = targets["sample_id"]
+            outputs = {}
+
 
             # Iterate through all of the samples in the batch
             for idx, sample_id in enumerate(sample_ids):
@@ -62,6 +81,7 @@ class PredictionWriter(Callback):
         # handle unbatched case
         else:
             self.write_sample(batch_idx, inputs, targets, outputs, preds, losses, 0)
+
 
     def write_sample(self, sample_id, inputs, targets, outputs, preds, losses, idx):
         """Write a single sample to the output file."""
@@ -77,15 +97,34 @@ class PredictionWriter(Callback):
         if self.write_targets:
             self.write_items(sample_group, "targets", targets, idx)
 
-        # Items produced by model have layer/task structure
-        if self.write_outputs:
-            self.write_layer_task_items(sample_group, "outputs", outputs, idx)
+        self.create_dataset(sample_group, "preds/masks", preds["masks"])
+        self.create_dataset(sample_group, "preds/class_preds", preds["class_probs"])
+        # if "sort" in preds:
+        #     self.create_dataset(sample_group, "preds/sort_phi", preds["sort"]["hit_phi"])
 
-        if self.write_preds:
-            self.write_layer_task_items(sample_group, "preds", preds, idx)
+    # def write_sample(self, sample_id, inputs, targets, outputs, preds, losses, idx):
+    #     """Write a single sample to the output file."""
+    #     # create a group for thie sample_id
+    #     if isinstance(sample_id, Tensor):
+    #         sample_id = sample_id.item()
+    #     sample_group = self.file.create_group(str(sample_id))
 
-        if self.write_losses:
-            self.write_layer_task_items(sample_group, "losses", losses, idx)
+    #     # Write inputs and targets
+    #     if self.write_inputs:
+    #         self.write_items(sample_group, "inputs", inputs, idx)
+
+    #     if self.write_targets:
+    #         self.write_items(sample_group, "targets", targets, idx)
+
+    #     # Items produced by model have layer/task structure
+    #     if self.write_outputs:
+    #         self.write_layer_task_items(sample_group, "outputs", outputs, idx)
+
+    #     if self.write_preds:
+    #         self.write_layer_task_items(sample_group, "preds", preds, idx)
+
+    #     if self.write_losses:
+    #         self.write_layer_task_items(sample_group, "losses", losses, idx)
 
     def write_items(self, sample_group, item_name, items, idx):
         # This will write out a dict of items that has the structure
@@ -108,6 +147,8 @@ class PredictionWriter(Callback):
             for task_name, task_items in layer_items.items():
                 task_group = layer_group.create_group(task_name)
                 for name, value in task_items.items():
+                    print(task_group)
+                    print(name)
                     self.create_dataset(task_group, name, value[idx][None, ...])
 
     def create_dataset(self, group, name, value):

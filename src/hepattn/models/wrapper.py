@@ -257,8 +257,9 @@ class ModelWrapper(LightningModule):
         inputs, targets = batch
 
         # Get the model outputs
-        preds = self.model(inputs)
-        loss = self.model.loss(preds, targets)
+        outputs = self.model(inputs)
+        loss = self.model.loss(outputs, targets)
+        preds = outputs["final"]["preds"]
 
         # Compute and log losses
         total_loss = self.log_losses(loss, "train")
@@ -272,9 +273,10 @@ class ModelWrapper(LightningModule):
     def validation_step(self, batch):
         inputs, targets = batch
 
-        # Get the raw model outputs
-        preds = self.model(inputs, targets)
-        loss = self.model.loss(preds, targets)
+        # Get the model outputs
+        outputs = self.model(inputs)
+        loss = self.model.loss(outputs, targets)
+        preds = outputs["final"]["preds"]
 
         # Compute and log losses
         total_loss = self.log_losses(loss, "val")
@@ -286,7 +288,7 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch):
         inputs, targets = batch
-        preds = self.model(inputs, targets)
+        preds = self.model(inputs)
         return self.model.predict(preds)
 
     def on_train_start(self):

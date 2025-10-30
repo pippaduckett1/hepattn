@@ -61,9 +61,6 @@ class MaskFormer(nn.Module):
 
         assert not (input_sort_field and sorter), "Cannot specify both input_sort_field and sorter."
         self.input_sort_field = input_sort_field
-        self.sorter = sorter
-        if self.sorter is not None:
-            self.sorter.input_names = self.input_names
 
         assert "key" not in self.input_names, "'key' input name is reserved."
         assert "query" not in self.input_names, "'query' input name is reserved."
@@ -77,64 +74,49 @@ class MaskFormer(nn.Module):
         batch_size = inputs[self.input_names[0] + "_valid"].shape[0]
         x = {"inputs": inputs}
 
-        # Embed the input constituents
-        for input_net in self.input_nets:
-            input_name = input_net.input_name
-            x[input_name + "_embed"] = input_net(inputs)
-            x[input_name + "_valid"] = inputs[input_name + "_valid"]
+        device = inputs["hit_valid"].device
 
-            # These slices can be used to pick out specific
-            # objects after we have merged them all together
-            # TODO: Clean this up
-            device = inputs[input_name + "_valid"].device
-            mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
-            x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
+        # # Embed the input constituents
+        # for input_net in self.input_nets:
+        #     input_name = input_net.input_name
+        #     x[input_name + "_embed"] = input_net(inputs)
+        #     x[input_name + "_valid"] = inputs[input_name + "_valid"]
 
-        # Merge the input constituents and the padding mask into a single set
-        x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
-        x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.input_names], dim=-1)
+        #     # These slices can be used to pick out specific
+        #     # objects after we have merged them all together
+        #     # TODO: Clean this up
+        #     mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
+        #     x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
+
+        x["hit_embed"] = self.input_nets[0](inputs)
+        x["hit_valid"] = inputs["hit_valid"]
+
+        # # Merge the input constituents and the padding mask into a single set
+        # x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
+        # x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.input_names], dim=-1)
 
         # if all key_valid are true, then we can just set it to None
-        if batch_size == 1 and x["key_valid"].all():
-            x["key_valid"] = None
-
-        if self.input_sort_field and not self.sorter:
-            x[f"key_{self.input_sort_field}"] = torch.concatenate(
-                [inputs[input_name + "_" + self.input_sort_field] for input_name in self.input_names], dim=-1
-            )
-
-        # Dedicated sorting step before encoder
-        if self.sorter is not None:
-            x[f"key_{self.sorter.input_sort_field}"] = torch.concatenate(
-                [inputs[input_name + "_" + self.sorter.input_sort_field] for input_name in self.input_names], dim=-1
-            )
-            for input_name in self.input_names:
-                field = f"{input_name}_{self.sorter.input_sort_field}"
-                x[field] = inputs[field]
-            x = self.sorter.sort_inputs(x)
+        # if batch_size == 1 and x["key_valid"].all():
+        #     x["key_valid"] = None
 
         # Pass merged input constituents through the encoder
-        x_sort_value = x.get(f"key_{self.input_sort_field}") if self.sorter is None else None
-        x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x_sort_value, kv_mask=x.get("key_valid"))
+        # x_sort_value = x.get(f"key_{self.input_sort_field}") if self.sorter is None else None
+        # x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x_sort_value, kv_mask=x.get("key_valid"))
+        
+        x["hit_embed"] = self.encoder(x["hit_embed"], x_sort_value=inputs["hit_phi"])
 
         # Unmerge the updated features back into the separate input types
-        x = unmerge_inputs(x, self.input_names)
+        # x = unmerge_inputs(x, self.input_names)
 
         # get mask and flavour predictions
-        preds = self.mask_decoder(x["key_embed"], x.get("key_valid"))
-        # Pass through decoder layers
-        # x, outputs = self.decoder(x, self.input_names)
+        # preds = self.mask_decoder(x["key_embed"], x.get("key_valid"))
+        # preds = self.mask_decoder(x["key_embed"])
+        preds = self.mask_decoder(x["hit_embed"])
 
         outputs = {"final": {"preds": preds}}
 
         for task in self.tasks:
             outputs["final"][task.name] = task(x)
-
-        # store info about the input sort field for each input type
-        if self.sorter is not None:
-            sort = self.sorter.input_sort_field
-            sort_dict = {f"{name}_{sort}": inputs[f"{name}_{sort}"] for name in self.input_names}
-            outputs["final"][sort] = sort_dict
 
         return outputs
 
@@ -149,8 +131,8 @@ class MaskFormer(nn.Module):
         Returns:
             preds: A dictionary containing the predicted values for each task.
         """
-        preds: dict[str, dict[str, Any]] = {}
-        preds["preds"] = outputs["final"]["preds"]
+        preds = outputs["final"]["preds"]
+
 
         for task in self.tasks:
             if task.input_type == "queries":
@@ -161,10 +143,9 @@ class MaskFormer(nn.Module):
 
         return preds
 
-    def loss(self, preds: dict, targets: dict) -> dict:
-        # get the loss, updating the preds and labels with the best matching
-        if self.sorter is not None:
-            targets = self.sorter.sort_targets(targets, preds["final"][self.sorter.input_sort_field])
+    def loss(self, outputs: dict, targets: dict) -> dict:
+
+        preds = outputs["final"]["preds"]
 
         preds, targets, loss = self.loss_fn(preds, targets)
 

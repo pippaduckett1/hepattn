@@ -148,18 +148,19 @@ class TrackMLDataset(Dataset):
         targets["hit_tgt_pid"] = torch.from_numpy(hits["tgt_pid"].values).unsqueeze(0)
         targets["hit_hit_tgt"] = targets["hit_tgt_pid"] != 0
 
-        targets["hit_pid"] = torch.from_numpy(hits["particle_id"].values).unsqueeze(0)
-        targets["hit_hid"] = torch.from_numpy(hits["hit_id"].values).unsqueeze(0)
-        targets["hit_weight"] = torch.from_numpy(hits["weight"].values).unsqueeze(0)
-        targets["truth_particle_id"] = torch.from_numpy(truth["particle_id"].values).unsqueeze(0)
-        targets["truth_hit_id"] = torch.from_numpy(truth["hit_id"].values).unsqueeze(0)
-        targets["truth_weight"] = torch.from_numpy(truth["weight"].values).unsqueeze(0)
-        targets["all_pids"] = torch.from_numpy(all_parts["particle_id"].values).unsqueeze(0)
-        targets["all_pts"] = torch.from_numpy(all_parts["pt"].values).unsqueeze(0)
-        targets["all_etas"] = torch.from_numpy(all_parts["eta"].values).unsqueeze(0)
-        targets["all_phis"] = torch.from_numpy(all_parts["phi"].values).unsqueeze(0)
-        targets["all_vzs"] = torch.from_numpy(all_parts["vz"].values).unsqueeze(0)
-        targets["all_nhits"] = torch.from_numpy(all_parts["nhits"].values).unsqueeze(0)
+        targets["eval_hit_pid"] = torch.from_numpy(hits["particle_id"].values).unsqueeze(0)
+        targets["eval_hit_phi"] = torch.from_numpy(hits["phi"].values).unsqueeze(0)
+        targets["eval_hit_hid"] = torch.from_numpy(hits["hit_id"].values).unsqueeze(0)
+        targets["eval_hit_weight"] = torch.from_numpy(hits["weight"].values).unsqueeze(0)
+        targets["eval_truth_particle_id"] = torch.from_numpy(truth["particle_id"].values).unsqueeze(0)
+        targets["eval_truth_hit_id"] = torch.from_numpy(truth["hit_id"].values).unsqueeze(0)
+        targets["eval_truth_weight"] = torch.from_numpy(truth["weight"].values).unsqueeze(0)
+        targets["eval_all_pids"] = torch.from_numpy(all_parts["particle_id"].values).unsqueeze(0)
+        targets["eval_all_pts"] = torch.from_numpy(all_parts["pt"].values).unsqueeze(0)
+        targets["eval_all_etas"] = torch.from_numpy(all_parts["eta"].values).unsqueeze(0)
+        targets["eval_all_phis"] = torch.from_numpy(all_parts["phi"].values).unsqueeze(0)
+        targets["eval_all_vzs"] = torch.from_numpy(all_parts["vz"].values).unsqueeze(0)
+        targets["eval_all_nhits"] = torch.from_numpy(all_parts["nhits"].values).unsqueeze(0)
 
         # Build the regression targets
         if "particle" in self.targets:
@@ -244,6 +245,9 @@ class TrackMLDataset(Dataset):
         assert len(particles) != 0, "No particles remaining - loosen selection!"
         assert len(hits) != 0, "No hits remaining - loosen selection!"
         assert particles["particle_id"].nunique() == len(particles), "Non-unique particle ids"
+
+        # sort hits by phi
+        hits = hits.sort_values("phi")
 
         # Check that all hits have different phi
         # This is necessary as the fast sorting algorithm used by pytorch can be non-stable
