@@ -281,7 +281,7 @@ class MaskFormer(nn.Module):
         input_nets: nn.ModuleList,
         encoder: nn.Module,
         decoder: nn.Module,
-        # tasks: nn.ModuleList | None,
+        tasks: nn.ModuleList | None,
         dim: int,
         target_object: str = "particle",
         pooling: nn.Module | None = None,
@@ -308,10 +308,9 @@ class MaskFormer(nn.Module):
 
         self.input_nets = input_nets
         self.encoder = encoder
-        self.mask_decoder = decoder
-        # self.decoder.tasks = tasks
+        self.decoder = decoder
+        self.decoder.tasks = tasks
         self.pooling = pooling
-        tasks = []
         self.tasks = tasks
         self.target_object = target_object
         # self.matcher = matcher
@@ -337,28 +336,28 @@ class MaskFormer(nn.Module):
 
         device = inputs["hit_valid"].device
 
-        # # Embed the input constituents
-        # for input_net in self.input_nets:
-        #     input_name = input_net.input_name
-        #     x[input_name + "_embed"] = input_net(inputs)
-        #     x[input_name + "_valid"] = inputs[input_name + "_valid"]
+        # Embed the input constituents
+        for input_net in self.input_nets:
+            input_name = input_net.input_name
+            x[input_name + "_embed"] = input_net(inputs)
+            x[input_name + "_valid"] = inputs[input_name + "_valid"]
 
-        #     # These slices can be used to pick out specific
-        #     # objects after we have merged them all together
-        #     # TODO: Clean this up
-        #     mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
-        #     x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
+            # These slices can be used to pick out specific
+            # objects after we have merged them all together
+            # TODO: Clean this up
+            mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
+            x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
 
-        x["hit_embed"] = self.input_nets[0](inputs)
-        x["hit_valid"] = inputs["hit_valid"]
+        # x["hit_embed"] = self.input_nets[0](inputs)
+        # x["hit_valid"] = inputs["hit_valid"]
 
-        # # Merge the input constituents and the padding mask into a single set
-        # x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
-        # x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.input_names], dim=-1)
+        # Merge the input constituents and the padding mask into a single set
+        x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
+        x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.input_names], dim=-1)
 
         # if all key_valid are true, then we can just set it to None
-        # if batch_size == 1 and x["key_valid"].all():
-        #     x["key_valid"] = None
+        if batch_size == 1 and x["key_valid"].all():
+            x["key_valid"] = None
 
         # if self.input_sort_field and not self.sorter:
         #     x[f"key_{self.input_sort_field}"] = torch.concatenate(
@@ -382,20 +381,20 @@ class MaskFormer(nn.Module):
             x = self.sorter.sort_inputs(x)
 
         # Pass merged input constituents through the encoder
-        # x_sort_value = x.get(f"key_{self.input_sort_field}") if self.sorter is None else None
-        # x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x_sort_value, kv_mask=x.get("key_valid"))
+        x_sort_value = x.get(f"key_{self.input_sort_field}") if self.sorter is None else None
+        x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x_sort_value, kv_mask=x.get("key_valid"))
 
-        x["hit_embed"] = self.encoder(x["hit_embed"], x_sort_value=inputs["hit_phi"])
+        # x["hit_embed"] = self.encoder(x["hit_embed"], x_sort_value=inputs["hit_phi"])
 
         # Unmerge the updated features back into the separate input types
-        # x = unmerge_inputs(x, self.input_names)
+        x = unmerge_inputs(x, self.input_names)
 
         # get mask and flavour predictions
-        # preds = self.mask_decoder(x["key_embed"], x.get("key_valid"))
-        # preds = self.mask_decoder(x["key_embed"])
+        # preds = self.decoder(x["key_embed"], x.get("key_valid"))
+        # preds = self.decoder(x["key_embed"])
 
         # Pass through decoder layers
-        x, outputs = self.mask_decoder(x, self.input_names)
+        x, outputs = self.decoder(x, self.input_names)
 
         # Do any pooling if desired
         if self.pooling is not None:
@@ -410,8 +409,8 @@ class MaskFormer(nn.Module):
         outputs["final"]["track_hit_valid"] = task_outputs
 
         pred_masks = task_outputs["track_hit_logit"]
-        class_outputs = track_valid_task(x["query_embed"])["track_logit"]
-        class_probs = class_outputs["track_logit"].sigmoid()
+        class_outputs = track_valid_task(x)["track_logit"]
+        class_probs = class_outputs.sigmoid()
         class_probs = torch.cat([1 - class_probs, class_probs], dim=-1)
 
         outputs["layer_final"] = {"track_hit_valid": task_outputs, "track_valid": class_outputs}
@@ -421,11 +420,11 @@ class MaskFormer(nn.Module):
             "x": x["hit_embed"],
             "masks": pred_masks,
             "class_probs": class_probs,
-            "class_logits": class_outputs["track_logit"],
+            "class_logits": class_outputs,
         }
         preds["intermediate_outputs"] = outputs["intermediate_outputs"]
 
-        outputs = {"final": {"preds": preds}}
+        outputs["final"] = {"preds": preds}
 
         # for task in self.tasks:
         #     outputs["final"][task.name] = task(x)
@@ -435,11 +434,6 @@ class MaskFormer(nn.Module):
         #     sort = self.sorter.input_sort_field
         #     sort_dict = {f"{name}_{sort}": inputs[f"{name}_{sort}"] for name in self.input_names}
         #     outputs["final"][sort] = sort_dict
-
-        # store info about the input sort field for each input type
-        if self.sorter is not None:
-            sort_dict = {"hit_phi": inputs["hit_phi"]}
-            outputs["final"]["phi"] = sort_dict
 
         return outputs
 
@@ -482,13 +476,18 @@ class MaskFormer(nn.Module):
 
         preds, targets, loss = self.loss_fn(preds, targets)
 
-        # configurable tasks here
-        for task in self.tasks:
-            if task.input_type == "queries":
-                task_loss = task.loss(preds, targets)
-            else:
-                task_preds, task_loss = task(preds, targets)
-                preds.update(task_preds)
-            loss.update(task_loss)
+        # # configurable tasks here
+        # for task in self.tasks:
+        #     if task.input_type == "queries":
+        #         task_loss = task.loss(preds, targets)
+        #     else:
+        #         task_preds, task_loss = task(preds, targets)
+        #         preds.update(task_preds)
+        #     loss.update(task_loss)
 
-        return loss
+            # If keys collide (e.g. object_bce in multiple tasks), one will overwrite the other.
+            # Use this instead
+            # for k, v in task_loss.items():
+            #     loss[f"{task.name}/{k}"] = v
+
+        return loss, targets

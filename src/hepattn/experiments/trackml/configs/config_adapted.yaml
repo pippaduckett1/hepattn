@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK-MAIN-SCALEUP-VERSION-epochs30-MA-eta2p5-pt600-hepformer-decoder-maskformer-10epochs
+name: TRK--epochs10-MA-eta2p5-pt600-hepformer-decoder-pippa-fork
 
 data:
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -116,8 +116,6 @@ model:
 
   # Whether to use multi task learning or not
   mtl: false
-
-  log_metrics_train: True
   
   model:
     class_path: hepattn.models.maskformer.MaskFormer
@@ -180,10 +178,7 @@ model:
           num_decoder_layers: 8
           num_queries: *num_objects
           dim: 256
-          decoder_layer_type: hepformer
           decoder_layer_config:
-            mask_attention: true
-            local_ca: false
             bidirectional_ca: true
             n_heads: 8
           mask_attention: true

@@ -16,7 +16,7 @@ from hepattn.models.dense import Dense
 from hepattn.models.encoder import Residual
 from hepattn.models.hepformer_attn import GLU, CrossAttention, SelfAttention
 from hepattn.models.posenc import pos_enc_symmetric
-from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
+# from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
 from hepattn.utils.local_ca import auto_local_ca_mask
 from hepattn.utils.model_utils import unmerge_inputs
 
@@ -64,7 +64,7 @@ class MaskFormerDecoder(nn.Module):
         super().__init__()
 
         self.dim = dim
-        self.decoder_layers = nn.ModuleList([MaskDecoderLayer(depth=i, dim=self.dim, **decoder_layer_config) for i in range(num_decoder_layers)])
+        self.decoder_layers = nn.ModuleList([MaskFormerDecoderLayer(depth=i, dim=self.dim, **decoder_layer_config) for i in range(num_decoder_layers)])
         self.tasks: list | None = None  # Will be set by MaskFormer
         # self.decoder_tasks = decoder_tasks
         self.num_queries = num_queries
@@ -94,28 +94,11 @@ class MaskFormerDecoder(nn.Module):
         self.norm2 = nn.LayerNorm(self.dim)
 
         self.initial_queries = nn.Parameter(torch.empty((num_queries, self.dim)))
-        nn.init.normal_(self.inital_q)
+        nn.init.normal_(self.initial_queries)
 
         # self.class_net = class_net
         # self.mask_net = mask_net
         self.aux_loss = aux_loss
-
-    def get_preds(self, queries: Tensor, mask_tokens: Tensor):
-        # get mask predictions from queries and mask tokens
-        pred_masks = get_masks(mask_tokens, queries, self.mask_net)  # [..., mask.squeeze(0)] when padding is enabled
-        # get class predictions from queries
-
-        if self.class_net is None:
-            return {"masks": pred_masks}
-
-        class_logits = self.class_net(queries)
-        if class_logits.shape[-1] == 1:
-            class_probs = class_logits.sigmoid()
-            class_probs = torch.cat([1 - class_probs, class_probs], dim=-1)
-        else:
-            class_probs = class_logits.softmax(-1)
-
-        return {"class_logits": class_logits, "class_probs": class_probs, "masks": pred_masks}
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -144,17 +127,17 @@ class MaskFormerDecoder(nn.Module):
 
         attn_mask = None
         attn_mask_transpose = None
-        if self.local_strided_attn:
-            assert x["query_embed"].shape[0] == 1, "Local strided attention only supports batch size 1"
-            if self.attn_type == "torch":
-                attn_mask = auto_local_ca_mask(x["query_embed"], x["key_embed"], self.window_size, wrap=self.window_wrap)
-            elif self.attn_type == "flex":
-                device = x["query_embed"].device
-                q_len = x["query_embed"].shape[1]
-                kv_len = x["key_embed"].shape[1]
-                dtype_float = x["query_embed"].dtype
-                attn_mask = self.flex_local_ca_mask(q_len, kv_len, device, dtype_float)
-                attn_mask_transpose = transpose_blockmask(attn_mask, q_tokens=q_len, kv_tokens=kv_len, dev=device)
+        # if self.local_strided_attn:
+        #     assert x["query_embed"].shape[0] == 1, "Local strided attention only supports batch size 1"
+        #     if self.attn_type == "torch":
+        #         attn_mask = auto_local_ca_mask(x["query_embed"], x["key_embed"], self.window_size, wrap=self.window_wrap)
+        #     elif self.attn_type == "flex":
+        #         device = x["query_embed"].device
+        #         q_len = x["query_embed"].shape[1]
+        #         kv_len = x["key_embed"].shape[1]
+        #         dtype_float = x["query_embed"].dtype
+        #         attn_mask = self.flex_local_ca_mask(q_len, kv_len, device, dtype_float)
+        #         attn_mask_transpose = transpose_blockmask(attn_mask, q_tokens=q_len, kv_tokens=kv_len, dev=device)
 
         intermediate_outputs: list | None = [] if self.aux_loss else None
         outputs: dict[str, dict] = {}
@@ -183,7 +166,7 @@ class MaskFormerDecoder(nn.Module):
             if self.aux_loss:
                 pred_masks = task_outputs["track_hit_logit"]
                 layer_intermediate_outputs["masks"] = pred_masks
-                class_outputs = track_valid_task(x["query_embed"])
+                class_outputs = track_valid_task(x)
                 class_logits = class_outputs["track_logit"]
                 class_probs = class_logits.sigmoid()
                 class_probs = torch.cat([1 - class_probs, class_probs], dim=-1)
@@ -364,8 +347,8 @@ class MaskFormerDecoderLayer(nn.Module):
         # Update key/constituent embeddings with the query/object embeddings
         if self.bidirectional_ca:
             if attn_mask is not None:
-                if self.attn_type == "flex":
-                    assert attn_mask_transpose is not None, "attn_mask_transpose must be provided for flex attention"
+                # if self.attn_type == "flex":
+                #     assert attn_mask_transpose is not None, "attn_mask_transpose must be provided for flex attention"
                 # Index from the back so we are batch shape agnostic
                 attn_mask = attn_mask_transpose if attn_mask_transpose is not None else attn_mask.transpose(1, 2)
 

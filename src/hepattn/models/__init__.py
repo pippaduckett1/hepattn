@@ -1,6 +1,6 @@
 from hepattn.models.activation import SwiGLU
 from hepattn.models.attention import Attention
-from hepattn.models.decoder import MaskFormerDecoder, MaskFormerDecoderLayer
+from hepattn.models.hepattn_decoder import MaskFormerDecoder, MaskFormerDecoderLayer
 from hepattn.models.dense import Dense
 from hepattn.models.encoder import DropPath, Encoder, EncoderLayer, LayerScale, Residual
 from hepattn.models.hitfilter import HitFilter
