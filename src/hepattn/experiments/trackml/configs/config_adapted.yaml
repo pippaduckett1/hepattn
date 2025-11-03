@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK--epochs10-MA-eta2p5-pt600-hepformer-decoder-pippa-fork
+name: TRK-epochs10-MA-eta2p5-pt600-hepformer-decoder-init-net-pippa-fork-outputsize-256
 
 data:
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -44,6 +44,7 @@ data:
       - s
       - eta
       - phi
+      - theta
       - u
       - v
       # Hit local charge information
@@ -139,15 +140,15 @@ model:
         class_path: torch.nn.ModuleList
         init_args:
           modules:
-            - class_path: hepattn.models.InputNet
+            - class_path: hepattn.models.hepformer_initnet.InitNet
               init_args:
-                input_name: hit
-                # Which fields will be used to construct this input type
+                name: hit
                 fields:
                   - x
                   - y
                   - z
                   - r
+                  - s
                   - eta
                   - phi
                   - u
@@ -163,15 +164,23 @@ model:
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
-                    input_size: 16
-                    output_size: *dim
-                posenc:
-                  class_path: hepattn.models.PositionEncoder
+                    input_size: 17
+                    output_size: 256
+                    hidden_layers:
+                    - 256
+                    hidden_dim_scale: 2
+                    activation: torch.nn.SiLU
+                    final_activation: null
+                    dropout: 0.0
+                pos_enc:
+                  class_path: hepattn.utils.hepformer_positional_enc.PositionalEncoder
                   init_args:
-                    input_name: hit
-                    fields:
-                      - phi
-                    dim: *dim
+                    variables:
+                    - phi
+                    - theta
+                    - r
+                    dim: 256
+                    alpha: 2000
       decoder:
         class_path: hepattn.models.hepattn_decoder.MaskFormerDecoder
         init_args:
@@ -207,7 +216,7 @@ model:
                   class_path: hepattn.models.Dense
                   init_args:
                     input_size: 256
-                    output_size: 1
+                    output_size: 256
                     hidden_layers: null
                     hidden_dim_scale: 2
                     activation: torch.nn.SiLU

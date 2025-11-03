@@ -319,40 +319,42 @@ class MaskFormer(nn.Module):
         assert not (input_sort_field and sorter), "Cannot specify both input_sort_field and sorter."
         self.input_sort_field = input_sort_field
         self.sorter = sorter
-        if self.sorter is not None:
-            self.sorter.input_names = self.input_names
+        # if self.sorter is not None:
+        #     self.sorter.input_names = self.input_names
 
-        assert "key" not in self.input_names, "'key' input name is reserved."
-        assert "query" not in self.input_names, "'query' input name is reserved."
-        assert not any("_" in name for name in self.input_names), "Input names cannot contain underscores."
+        # assert "key" not in self.input_names, "'key' input name is reserved."
+        # assert "query" not in self.input_names, "'query' input name is reserved."
+        # assert not any("_" in name for name in self.input_names), "Input names cannot contain underscores."
 
-    @property
-    def input_names(self) -> list[str]:
-        return [input_net.input_name for input_net in self.input_nets]
+    # @property
+    # def input_names(self) -> list[str]:
+    #     return [input_net.input_name for input_net in self.input_nets]
 
     def forward(self, inputs: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        self.input_names = ["hit"]
         batch_size = inputs[self.input_names[0] + "_valid"].shape[0]
         x = {"inputs": inputs}
 
         device = inputs["hit_valid"].device
 
         # Embed the input constituents
-        for input_net in self.input_nets:
-            input_name = input_net.input_name
-            x[input_name + "_embed"] = input_net(inputs)
-            x[input_name + "_valid"] = inputs[input_name + "_valid"]
+        # for input_net in self.input_nets:
+            # input_name = input_net.input_name
+        input_name = "hit"
+        x[input_name + "_embed"] = self.input_nets[0](inputs)
+        x[input_name + "_valid"] = inputs[input_name + "_valid"]
 
-            # These slices can be used to pick out specific
-            # objects after we have merged them all together
-            # TODO: Clean this up
-            mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
-            x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
+        # These slices can be used to pick out specific
+        # objects after we have merged them all together
+        # TODO: Clean this up
+        mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
+        x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
 
         # x["hit_embed"] = self.input_nets[0](inputs)
         # x["hit_valid"] = inputs["hit_valid"]
 
         # Merge the input constituents and the padding mask into a single set
-        x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
+        # x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
         x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.input_names], dim=-1)
 
         # if all key_valid are true, then we can just set it to None
@@ -375,19 +377,19 @@ class MaskFormer(nn.Module):
         #     x = self.sorter.sort_inputs(x)
 
         # Dedicated sorting step before encoder
-        if self.sorter is not None:
-            x["hit_phi"] = inputs["hit_phi"]
-            x["key_phi"] = inputs["hit_phi"]
-            x = self.sorter.sort_inputs(x)
+        # if self.sorter is not None:
+        #     x["hit_phi"] = inputs["hit_phi"]
+        #     x["key_phi"] = inputs["hit_phi"]
+        #     x = self.sorter.sort_inputs(x)
 
         # Pass merged input constituents through the encoder
-        x_sort_value = x.get(f"key_{self.input_sort_field}") if self.sorter is None else None
-        x["key_embed"] = self.encoder(x["key_embed"], x_sort_value=x_sort_value, kv_mask=x.get("key_valid"))
+        x_sort_value = x.get(f"key_{self.input_sort_field}")
+        x["hit_embed"] = self.encoder(x["hit_embed"], x_sort_value=x_sort_value)
 
         # x["hit_embed"] = self.encoder(x["hit_embed"], x_sort_value=inputs["hit_phi"])
 
         # Unmerge the updated features back into the separate input types
-        x = unmerge_inputs(x, self.input_names)
+        # x = unmerge_inputs(x, self.input_names)
 
         # get mask and flavour predictions
         # preds = self.decoder(x["key_embed"], x.get("key_valid"))
@@ -396,35 +398,10 @@ class MaskFormer(nn.Module):
         # Pass through decoder layers
         x, outputs = self.decoder(x, self.input_names)
 
-        # Do any pooling if desired
-        if self.pooling is not None:
-            x_pooled = self.pooling(x[f"{self.pooling.input_name}_embed"], x[f"{self.pooling.input_name}_valid"])
-            x[f"{self.pooling.output_name}_embed"] = x_pooled
-
-        track_hit_logit_task = [task for task in self.tasks if task.name == "track_hit_valid"][0]
-        track_valid_task = [task for task in self.tasks if task.name == "track_valid"][0]
-        # Get the final outputs
-        outputs["final"] = {}
-        task_outputs = track_hit_logit_task(x)
-        outputs["final"]["track_hit_valid"] = task_outputs
-
-        pred_masks = task_outputs["track_hit_logit"]
-        class_outputs = track_valid_task(x)["track_logit"]
-        class_probs = class_outputs.sigmoid()
-        class_probs = torch.cat([1 - class_probs, class_probs], dim=-1)
-
-        outputs["layer_final"] = {"track_hit_valid": task_outputs, "track_valid": class_outputs}
-
-        preds = {
-            "queries": x["query_embed"],
-            "x": x["hit_embed"],
-            "masks": pred_masks,
-            "class_probs": class_probs,
-            "class_logits": class_outputs,
-        }
-        preds["intermediate_outputs"] = outputs["intermediate_outputs"]
-
-        outputs["final"] = {"preds": preds}
+        # # Do any pooling if desired
+        # if self.pooling is not None:
+        #     x_pooled = self.pooling(x[f"{self.pooling.input_name}_embed"], x[f"{self.pooling.input_name}_valid"])
+        #     x[f"{self.pooling.output_name}_embed"] = x_pooled
 
         # for task in self.tasks:
         #     outputs["final"][task.name] = task(x)
@@ -450,13 +427,13 @@ class MaskFormer(nn.Module):
         """
         preds = outputs["final"]["preds"]
 
-        if self.sorter is not None:
-            # 1. get the sort indices used in forward
-            sort_idx = torch.argsort(outputs["final"]["phi"]["hit_phi"], dim=-1)
-            # 2. compute the inverse permutation
-            inv_sort_idx = torch.argsort(sort_idx, dim=-1)
-            # 3. unsort the masks (and any other hit-level preds)
-            preds["masks"] = torch.gather(preds["masks"], -1, inv_sort_idx.unsqueeze(1).expand_as(preds["masks"]))
+        # if self.sorter is not None:
+        #     # 1. get the sort indices used in forward
+        #     sort_idx = torch.argsort(outputs["final"]["phi"]["hit_phi"], dim=-1)
+        #     # 2. compute the inverse permutation
+        #     inv_sort_idx = torch.argsort(sort_idx, dim=-1)
+        #     # 3. unsort the masks (and any other hit-level preds)
+        #     preds["masks"] = torch.gather(preds["masks"], -1, inv_sort_idx.unsqueeze(1).expand_as(preds["masks"]))
 
         # for task in self.tasks:
         #     if task.input_type == "queries":

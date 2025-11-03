@@ -16,9 +16,11 @@ from hepattn.models.dense import Dense
 from hepattn.models.encoder import Residual
 from hepattn.models.hepformer_attn import GLU, CrossAttention, SelfAttention
 from hepattn.models.posenc import pos_enc_symmetric
+
 # from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
 from hepattn.utils.local_ca import auto_local_ca_mask
 from hepattn.utils.model_utils import unmerge_inputs
+from hepattn.models.task import ObjectHitMaskTask
 
 
 class MaskFormerDecoder(nn.Module):
@@ -64,7 +66,9 @@ class MaskFormerDecoder(nn.Module):
         super().__init__()
 
         self.dim = dim
-        self.decoder_layers = nn.ModuleList([MaskFormerDecoderLayer(depth=i, dim=self.dim, **decoder_layer_config) for i in range(num_decoder_layers)])
+        self.decoder_layers = nn.ModuleList([
+            MaskFormerDecoderLayer(depth=i, dim=self.dim, **decoder_layer_config) for i in range(num_decoder_layers)
+        ])
         self.tasks: list | None = None  # Will be set by MaskFormer
         # self.decoder_tasks = decoder_tasks
         self.num_queries = num_queries
@@ -114,8 +118,10 @@ class MaskFormerDecoder(nn.Module):
             ValueError: If in merged input mode and multiple attention masks are provided.
         """
 
-        batch_size = x["key_embed"].shape[0]
-        num_constituents = x["key_embed"].shape[-2]
+        # batch_size = x["key_embed"].shape[0]
+        # num_constituents = x["key_embed"].shape[-2]
+        batch_size = x["hit_embed"].shape[0]
+        num_constituents = x["hit_embed"].shape[-2]
 
         x["query_embed"] = self.norm1(self.initial_queries.expand(x["hit_embed"].shape[0], -1, -1))
         x["hit_embed"] = self.norm2(x["hit_embed"])
@@ -160,8 +166,8 @@ class MaskFormerDecoder(nn.Module):
             task_outputs = track_hit_logit_task(x)
 
             outputs[f"layer_{layer_index}"]["track_hit_valid"] = task_outputs
-            attn_mask = track_hit_logit_task.attn_mask(task_outputs)["hit"]
-            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            # attn_mask = task_outputs["track_hit_logit"].detach().sigmoid() < 0.1
+            # attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
             if self.aux_loss:
                 pred_masks = task_outputs["track_hit_logit"]
@@ -217,23 +223,51 @@ class MaskFormerDecoder(nn.Module):
                 outputs[f"layer_{layer_index}"]["attn_mask"] = attn_mask
 
             # Update the keys and queries
-            x["query_embed"], x["key_embed"] = decoder_layer(
+            x["query_embed"], x["hit_embed"] = decoder_layer(
                 x["query_embed"],
-                x["key_embed"],
+                x["hit_embed"],
                 attn_mask=attn_mask,
                 q_mask=x.get("query_mask"),
                 kv_mask=x.get("key_valid"),
-                # query_posenc=x["query_posenc"] if (self.posenc and not self.mask_attention) else None,
-                # key_posenc=x["key_posenc"] if (self.posenc and not self.mask_attention) else None,
-                # attn_mask_transpose=attn_mask_transpose,
+                query_posenc=x["query_posenc"] if (self.posenc and not self.mask_attention) else None,
+                key_posenc=x["key_posenc"] if (self.posenc and not self.mask_attention) else None,
+                attn_mask_transpose=attn_mask_transpose,
+                track_hit_logit_task=track_hit_logit_task,
+                x=x,
             )
 
             # update the individual input constituent representations only if not in merged input mode
-            if not self.unified_decoding:
-                x = unmerge_inputs(x, input_names)
+            # if not self.unified_decoding:
+            #     x = unmerge_inputs(x, input_names)
 
         if self.aux_loss:
             outputs["intermediate_outputs"] = intermediate_outputs
+
+        track_hit_logit_task = [task for task in self.tasks if task.name == "track_hit_valid"][0]
+        track_valid_task = [task for task in self.tasks if task.name == "track_valid"][0]
+        # Get the final outputs
+        outputs["final"] = {}
+        task_outputs = track_hit_logit_task(x)
+        outputs["final"]["track_hit_valid"] = task_outputs
+
+        pred_masks = task_outputs["track_hit_logit"]
+        class_outputs = track_valid_task(x)["track_logit"]
+        class_probs = class_outputs.sigmoid()
+        class_probs = torch.cat([1 - class_probs, class_probs], dim=-1)
+
+        outputs["layer_final"] = {"track_hit_valid": task_outputs, "track_valid": class_outputs}
+
+        preds = {
+            "queries": x["query_embed"],
+            "x": x["hit_embed"],
+            "masks": pred_masks,
+            "class_probs": class_probs,
+            "class_logits": class_outputs,
+        }
+        preds["intermediate_outputs"] = outputs["intermediate_outputs"]
+
+        outputs["final"] = {"preds": preds}
+        
         return x, outputs
 
     def flex_local_ca_mask(self, q_len: int, kv_len: int, device):
@@ -314,6 +348,8 @@ class MaskFormerDecoderLayer(nn.Module):
         query_posenc: Tensor | None = None,
         key_posenc: Tensor | None = None,
         attn_mask_transpose: Tensor | None = None,
+        track_hit_logit_task: ObjectHitMaskTask | None = None,
+        x: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Forward pass for the decoder layer.
 
@@ -334,6 +370,12 @@ class MaskFormerDecoderLayer(nn.Module):
             q = q + query_posenc
         if key_posenc is not None:
             kv = kv + key_posenc
+
+        if (attn_mask is None) and (track_hit_logit_task is not None):
+            # Get the outputs of the task given the current embeddings
+            task_outputs = track_hit_logit_task(x)["track_hit_logit"]
+            attn_mask = task_outputs.detach().sigmoid() < 0.1
+            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
         # update queries with cross attention from nodes
         q = q + self.q_ca(q, kv, kv_mask=kv_mask, attn_mask=attn_mask)
@@ -373,51 +415,3 @@ class MaskFormerDecoderLayer(nn.Module):
 
         if self.bidirectional_ca:
             self.kv_ca.fn.set_backend(attn_type)
-
-
-class MaskDecoderLayer(nn.Module):
-    def __init__(self, dim: int, n_heads: int, mask_attention: bool, bidirectional_ca: bool, depth: int = 0, local_ca: int | None = None) -> None:
-        super().__init__()
-
-        self.mask_attention = mask_attention
-        self.bidirectional_ca = bidirectional_ca
-        self.local_ca = local_ca
-
-        self.q_ca = CrossAttention(dim=dim, n_heads=n_heads)
-        self.q_sa = SelfAttention(dim=dim, n_heads=n_heads)
-        self.q_dense = GLU(dim)
-        if bidirectional_ca:
-            self.kv_ca = CrossAttention(dim=dim, n_heads=n_heads)
-            self.kv_dense = GLU(dim)
-
-    def forward(self, q: Tensor, kv: Tensor, mask_net: nn.Module, kv_mask: Tensor | None = None, q_mask: Tensor | None = None) -> Tensor:
-        attn_mask = None
-
-        # if we want to do mask attention
-        if self.mask_attention:
-            scores = get_masks(kv, q, mask_net).detach()
-
-            # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
-            attn_mask = scores.sigmoid() < 0.1
-
-            # if the attn mask is completely invalid for a given query, allow it to attend everywhere
-            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
-
-        # update queries with cross attention from nodes
-        q = q + self.q_ca(q, kv, kv_mask=kv_mask, attn_mask=attn_mask)
-
-        # update queries with self attention
-        q = q + self.q_sa(q)
-
-        # dense update
-        q = q + self.q_dense(q)
-
-        # update nodes with cross attention from queries and dense layer
-        # TODO: test also with self attention
-        if self.bidirectional_ca:
-            if attn_mask is not None:
-                attn_mask = attn_mask.transpose(1, 2)
-            kv = kv + self.kv_ca(kv, q, q_mask=kv_mask, attn_mask=attn_mask)
-            kv = kv + self.kv_dense(kv)
-
-        return q, kv
