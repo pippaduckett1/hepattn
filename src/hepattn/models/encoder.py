@@ -49,7 +49,7 @@ class Residual(nn.Module):
         self,
         fn: nn.Module,
         dim: int,
-        norm: str | None,
+        norm: str | None = None,
         post_norm: bool = False,
         layer_scale: float | None = None,
         drop_path: float = 0.0,
