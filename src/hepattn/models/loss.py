@@ -88,6 +88,7 @@ def mask_dice_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=
     return loss.mean()
 
 
+
 def mask_dice_cost(pred_logits, targets, input_pad_mask=None, sample_weight=None):
     """Compute DICE costs.
     Invalid objects are handled later in the matching process.

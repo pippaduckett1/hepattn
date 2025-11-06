@@ -3,9 +3,11 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from collections.abc import Mapping
 from hepattn.models.decoder import MaskFormerDecoder
 from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
 from hepattn.utils.model_utils import unmerge_inputs
+from hepattn.models.hepformer_loss import HEPFormerLoss
 
 
 class MaskFormer(nn.Module):
@@ -22,6 +24,8 @@ class MaskFormer(nn.Module):
         input_sort_field: str | None = None,
         sorter: nn.Module | None = None,
         unified_decoding: bool = False,
+        hepf_loss: bool = False,
+        loss_config: Mapping | None = None,
     ):
         """Initializes the MaskFormer model, which is a modular transformer-style architecture designed
         for multi-task object reconstruction with attention-based decoding and optional encoder blocks.
@@ -51,6 +55,7 @@ class MaskFormer(nn.Module):
         self.target_object = target_object
         self.matcher = matcher
         self.unified_decoding = unified_decoding
+        self.hepf_loss = hepf_loss
 
         assert not (input_sort_field and sorter), "Cannot specify both input_sort_field and sorter."
         self.input_sort_field = input_sort_field
@@ -61,6 +66,9 @@ class MaskFormer(nn.Module):
         assert "key" not in self.input_names, "'key' input name is reserved."
         assert "query" not in self.input_names, "'query' input name is reserved."
         assert not any("_" in name for name in self.input_names), "Input names cannot contain underscores."
+
+        if hepf_loss:
+            self.loss_fn = HEPFormerLoss(**loss_config, tasks=tasks)
 
     @property
     def input_names(self) -> list[str]:
@@ -163,8 +171,6 @@ class MaskFormer(nn.Module):
             preds[layer_name] = {}
 
             for task in self.tasks:
-                if layer_name != "final" and not task.has_intermediate_loss:
-                    continue
                 preds[layer_name][task.name] = task.predict(layer_outputs[task.name])
 
         return preds
@@ -183,6 +189,12 @@ class MaskFormer(nn.Module):
         Returns:
             losses: A dictionary containing the computed losses for each task.
         """
+        if self.hepf_loss:
+
+            preds, targets, loss = self.loss_fn(outputs, targets)
+
+            return loss, targets
+
         # Will hold the costs between all pairs of objects - cost axes are (batch, pred, true)
         costs = {}
         if self.sorter is not None:
@@ -245,3 +257,6 @@ class MaskFormer(nn.Module):
                 losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
 
         return losses, targets
+
+
+# TODO this version calls the matcher once whereas hepformer version calls the matcher separately for intermediate tasks BUT then does losses all together

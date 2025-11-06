@@ -45,14 +45,22 @@ class ModelWrapper(LightningModule):
 
     def aggregate_losses(self, losses: dict[str, Tensor], stage: str | None = None) -> Tensor:
         device = next(self.model.parameters()).device
-        total_loss = torch.tensor(0.0, device=device)
+        total_loss = torch.zeros(1, device=device, requires_grad=True)
 
         for layer_name, layer_losses in losses.items():
-            layer_loss = 0
-            for task_losses in layer_losses.values():
-                for loss_value in task_losses.values():
-                    total_loss += loss_value
-                    layer_loss += loss_value
+            layer_loss = torch.zeros(1, device=device, requires_grad=True)
+            if isinstance(layer_losses, dict):
+                for task_losses in layer_losses.values():
+                    if isinstance(task_losses, dict):
+                        for loss_value in task_losses.values():
+                            total_loss += loss_value
+                            layer_loss += loss_value
+                    else:
+                        total_loss += task_losses
+                        layer_loss += task_losses
+                else:
+                    total_loss += task_losses
+                    layer_loss += task_losses
 
             # Log the total loss from the layer
             self.log(f"{stage}/{layer_name}_loss", layer_loss, sync_dist=True)
@@ -176,7 +184,7 @@ class ModelWrapper(LightningModule):
         features = [outputs["final"][feature_name] for feature_name in feature_names]
 
         # TODO: Figure out if we can set retain_graph to false somehow, since it uses a lot of memory
-        task_losses = [sum(losses["final"][task.name].values()) for task in self.model.tasks]
+        sum(losses["final"][task.name].values()) for task in self.model.tasks]
         mtl_backward(losses=task_losses, features=features, aggregator=UPGrad(), retain_graph=True)
 
         # Manually perform the optimizer step
