@@ -17,7 +17,7 @@ from hepattn.models.posenc import pos_enc_symmetric
 from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
 from hepattn.utils.local_ca import auto_local_ca_mask
 from hepattn.utils.model_utils import unmerge_inputs
-
+from hepattn.models.hepformer_attn import GLU, CrossAttention, SelfAttention
 
 class MaskFormerDecoder(nn.Module):
     def __init__(
@@ -34,6 +34,7 @@ class MaskFormerDecoder(nn.Module):
         fast_local_ca: bool = False,
         block_size: int = 128,
         unified_decoding: bool = False,
+        hepf_changes: str = "",
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -54,6 +55,8 @@ class MaskFormerDecoder(nn.Module):
         """
         super().__init__()
 
+        self.hepf_changes = hepf_changes
+
         self.decoder_layers = nn.ModuleList([MaskFormerDecoderLayer(depth=i, **decoder_layer_config) for i in range(num_decoder_layers)])
         self.dim = decoder_layer_config["dim"]
         self.tasks: list | None = None  # Will be set by MaskFormer
@@ -66,15 +69,22 @@ class MaskFormerDecoder(nn.Module):
         self.window_size = window_size
         self.window_wrap = window_wrap
         self.unified_decoding = unified_decoding
-        self.initial_queries = nn.Parameter(torch.randn(self.num_queries, decoder_layer_config["dim"]))
         self.fast_local_ca = fast_local_ca
         self.block_size = block_size
+
+        if "hepf_init_queries" in self.hepf_changes:
+            self.initial_queries = nn.Parameter(torch.empty((num_queries, self.dim)))
+            nn.init.normal_(self.initial_queries)
+        else:
+            self.initial_queries = nn.Parameter(torch.randn(self.num_queries, decoder_layer_config["dim"]))
 
         if self.local_strided_attn:
             assert self.attn_type in {"torch", "flex"}, (
                 f"Invalid attention type when local_strided_attn is True: {self.attn_type}, must be 'torch' or 'flex'"
             )
         assert not (self.local_strided_attn and self.mask_attention), "local_strided_attn and mask_attention cannot both be True"
+
+        self.norm1 = nn.LayerNorm(self.dim)
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -94,6 +104,9 @@ class MaskFormerDecoder(nn.Module):
 
         # Generate the queries that represent objects
         x["query_embed"] = self.initial_queries.expand(batch_size, -1, -1)
+        if "query_norm" in self.hepf_changes:
+            x["query_embed"] = self.norm1(self.inital_q.expand(x["hit_embed"].shape[0], -1, -1))
+
         x["query_valid"] = torch.full((batch_size, self.num_queries), True, device=x["query_embed"].device)
 
         if self.posenc:
@@ -223,6 +236,53 @@ class MaskFormerDecoder(nn.Module):
         key_posenc = pos_enc_symmetric(x["key_phi"], self.dim, self.posenc["alpha"], self.posenc["base"])
         return query_posenc, key_posenc
 
+class HepattnSelfAttention(nn.Module):
+    def __init__(self, dim: int, **kwargs):
+        super().__init__()
+        self.dim = dim
+        self.attention = Attention(dim=dim, **kwargs)
+        self.norm = nn.LayerNorm(self.dim, elementwise_affine=False)
+
+    def forward(self, x: Tensor, **kwargs) -> Tensor:
+        x = self.norm(x)
+        return self.attention(x, x, **kwargs)
+
+
+class HepattnCrossAttention(nn.Module):
+    def __init__(self, dim: int, **kwargs):
+        super().__init__()
+        self.dim = dim
+        self.attention = Attention(dim=dim, **kwargs)
+        self.norm_q = nn.LayerNorm(self.dim, elementwise_affine=False)
+        self.norm_kv = nn.LayerNorm(self.dim, elementwise_affine=False)
+
+    def forward(self, q: Tensor, kv: Tensor, **kwargs) -> Tensor:
+        q = self.norm_q(q)
+        kv = self.norm_kv(kv)
+        return self.attention(q, kv, **kwargs)
+
+
+class HepattnGLU(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int | None = None, activation: str = "SiLU", bias: bool = True, gated: bool = True):
+        super().__init__()
+
+        if hidden_dim is None:
+            hidden_dim = dim * 2
+
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.gate = None
+        if gated:
+            self.gate = nn.Linear(dim, hidden_dim, bias=bias)
+        self.activation = getattr(nn, activation)()
+
+    def forward(self, x) -> Tensor:
+        x = self.norm(x)
+        out = self.activation(self.w1(x))
+        if self.gate:
+            out = out * self.gate(x)
+        return self.w2(out)
 
 class MaskFormerDecoderLayer(nn.Module):
     def __init__(
@@ -234,6 +294,11 @@ class MaskFormerDecoderLayer(nn.Module):
         attn_kwargs: dict | None = None,
         bidirectional_ca: bool = True,
         hybrid_norm: bool = False,
+        change_all: bool = False,
+        adjust: bool = False,
+        adjust_residual = False,
+        adjust_projections = False,
+        n_heads: int = 8
     ) -> None:
         """Initialize a MaskFormer decoder layer.
 
@@ -251,6 +316,8 @@ class MaskFormerDecoderLayer(nn.Module):
         self.dim = dim
         self.bidirectional_ca = bidirectional_ca
 
+        self.change_all = change_all
+
         # handle hybridnorm
         qkv_norm = hybrid_norm
         if depth == 0:
@@ -262,14 +329,48 @@ class MaskFormerDecoderLayer(nn.Module):
         self.attn_type = attn_kwargs.get("attn_type", "torch")
         dense_kwargs = dense_kwargs or {}
 
-        residual = partial(Residual, dim=dim, norm=norm)
-        self.q_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
-        self.q_sa = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
-        self.q_dense = residual(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm)
+        if change_all:
+            self.q_ca = CrossAttention(dim=dim, n_heads=n_heads)
+            self.q_sa = SelfAttention(dim=dim, n_heads=n_heads)
+            self.q_dense = GLU(dim)
+            if bidirectional_ca:
+                self.kv_ca = CrossAttention(dim=dim, n_heads=n_heads)
+                self.kv_dense = GLU(dim)
+        elif adjust:
+            residual = partial(Residual, dim=dim)
+            self.q_ca = residual(CrossAttention(dim=dim, n_heads=n_heads))
+            self.q_sa = residual(SelfAttention(dim=dim, n_heads=n_heads))
+            self.q_dense = residual(GLU(dim))
 
-        if self.bidirectional_ca:
-            self.kv_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
-            self.kv_dense = residual(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm)
+            if self.bidirectional_ca:
+                self.kv_ca = residual(CrossAttention(dim=dim, n_heads=n_heads))
+                self.kv_dense = residual(GLU(dim))     
+        elif adjust_residual:
+            residual = partial(Residual, dim=dim)
+            self.q_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+            self.q_sa = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+            self.q_dense = residual(Dense(dim, **dense_kwargs), norm=norm)
+
+            if self.bidirectional_ca:
+                self.kv_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+                self.kv_dense = residual(Dense(dim, **dense_kwargs), norm=norm)   
+        elif adjust_projections:
+            residual = partial(Residual, dim=dim)
+            self.q_ca = residual(HepattnCrossAttention(dim=dim))
+            self.q_sa = residual(HepattnSelfAttention(dim=dim))
+            self.q_dense = residual(HepattnGLU(dim))
+            if self.bidirectional_ca:
+                self.kv_ca = residual(HepattnCrossAttention(dim=dim))
+                self.kv_dense = residual(HepattnGLU(dim))
+        else:
+            residual = partial(Residual, dim=dim, norm=norm)
+            self.q_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+            self.q_sa = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+            self.q_dense = residual(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm)
+
+            if self.bidirectional_ca:
+                self.kv_ca = residual(Attention(dim, qkv_norm=qkv_norm, **attn_kwargs), norm=attn_norm)
+                self.kv_dense = residual(Dense(dim, **dense_kwargs), norm=norm, post_norm=dense_post_norm)
 
     def forward(
         self,
@@ -297,31 +398,50 @@ class MaskFormerDecoderLayer(nn.Module):
         Returns:
             Tuple of updated query and key/value embeddings.
         """
-        if query_posenc is not None:
-            q = q + query_posenc
-        if key_posenc is not None:
-            kv = kv + key_posenc
+        # if query_posenc is not None:
+        #     q = q + query_posenc
+        # if key_posenc is not None:
+        #     kv = kv + key_posenc
 
-        # Update query/object embeddings with the key/constituent embeddings
-        q = self.q_ca(q, kv=kv, attn_mask=attn_mask, q_mask=q_mask, kv_mask=kv_mask)
-        q = self.q_sa(q, q_mask=q_mask)
-        q = self.q_dense(q)
+        if self.change_all:
+            # update queries with cross attention from nodes
+            q = q + self.q_ca(q, kv, kv_mask=kv_mask, attn_mask=attn_mask)
+            # update queries with self attention
+            q = q + self.q_sa(q)
+            # dense update
+            q = q + self.q_dense(q)
 
-        # Update key/constituent embeddings with the query/object embeddings
-        if self.bidirectional_ca:
-            if attn_mask is not None:
-                if self.attn_type == "flex":
-                    assert attn_mask_transpose is not None, "attn_mask_transpose must be provided for flex attention"
-                # Index from the back so we are batch shape agnostic
-                attn_mask = attn_mask_transpose if attn_mask_transpose is not None else attn_mask.transpose(-2, -1)
+            if self.bidirectional_ca:
+                if attn_mask is not None:
+                    if self.attn_type == "flex":
+                        assert attn_mask_transpose is not None, "attn_mask_transpose must be provided for flex attention"
+                    # Index from the back so we are batch shape agnostic
+                    attn_mask = attn_mask_transpose if attn_mask_transpose is not None else attn_mask.transpose(1, 2)
 
-            if query_posenc is not None:
-                q = q + query_posenc
-            if key_posenc is not None:
-                kv = kv + key_posenc
+                kv = kv + self.kv_ca(kv, q, q_mask=kv_mask, attn_mask=attn_mask)
+                kv = kv + self.kv_dense(kv)
 
-            kv = self.kv_ca(kv, kv=q, attn_mask=attn_mask, q_mask=kv_mask, kv_mask=q_mask)
-            kv = self.kv_dense(kv)
+        else:
+            # Update query/object embeddings with the key/constituent embeddings
+            q = self.q_ca(q, kv=kv, attn_mask=attn_mask, kv_mask=kv_mask)
+            q = self.q_sa(q, q_mask=q_mask)
+            q = self.q_dense(q)
+
+            # Update key/constituent embeddings with the query/object embeddings
+            if self.bidirectional_ca:
+                if attn_mask is not None:
+                    if self.attn_type == "flex":
+                        assert attn_mask_transpose is not None, "attn_mask_transpose must be provided for flex attention"
+                    # Index from the back so we are batch shape agnostic
+                    attn_mask = attn_mask_transpose if attn_mask_transpose is not None else attn_mask.transpose(-2, -1)
+
+                # if query_posenc is not None:
+                #     q = q + query_posenc
+                # if key_posenc is not None:
+                #     kv = kv + key_posenc
+
+                kv = self.kv_ca(kv, kv=q, attn_mask=attn_mask, q_mask=kv_mask, kv_mask=q_mask)
+                kv = self.kv_dense(kv)
 
         return q, kv
 
