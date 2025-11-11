@@ -9,7 +9,6 @@ from lightning import LightningDataModule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from torch.utils.data import DataLoader, Dataset
 import math
-import os
 
 
 class TrackMLDataset(Dataset):
@@ -28,7 +27,6 @@ class TrackMLDataset(Dataset):
         dummy_data: bool = False,
         hit_particle_ratio=0,
         scale_coords=False,
-        use_old_hit_eval=False,
     ):
         super().__init__()
 
@@ -81,16 +79,10 @@ class TrackMLDataset(Dataset):
         self.event_names = event_names[:num_events]
         self.sample_ids = [int(name.removeprefix("event")) for name in self.event_names]
         self.hit_particle_ratio = hit_particle_ratio
-        self.use_old_hit_eval = use_old_hit_eval
 
         # Setup hit eval file if specified
         if self.hit_eval_path:
             rank_zero_info(f"Using hit eval dataset {self.hit_eval_path}")
-            print(self.hit_eval_path)
-            dir_path = os.path.dirname(self.hit_eval_path)
-            contents = os.listdir(dir_path)
-            print(contents)
-            self.hit_eval_file = h5py.File(self.hit_eval_path, "r")
 
         # Hit level cuts
         self.hit_volume_ids = hit_volume_ids
@@ -156,18 +148,19 @@ class TrackMLDataset(Dataset):
         targets["hit_tgt_pid"] = torch.from_numpy(hits["tgt_pid"].values).unsqueeze(0)
         targets["hit_hit_tgt"] = targets["hit_tgt_pid"] != 0
 
-        targets["hit_pid"] = torch.from_numpy(hits["particle_id"].values).unsqueeze(0)
-        targets["hit_hid"] = torch.from_numpy(hits["hit_id"].values).unsqueeze(0)
-        targets["hit_weight"] = torch.from_numpy(hits["weight"].values).unsqueeze(0)
-        targets["truth_particle_id"] = torch.from_numpy(truth["particle_id"].values).unsqueeze(0)
-        targets["truth_hit_id"] = torch.from_numpy(truth["hit_id"].values).unsqueeze(0)
-        targets["truth_weight"] = torch.from_numpy(truth["weight"].values).unsqueeze(0)
-        targets["all_pids"] = torch.from_numpy(all_parts["particle_id"].values).unsqueeze(0)
-        targets["all_pts"] = torch.from_numpy(all_parts["pt"].values).unsqueeze(0)
-        targets["all_etas"] = torch.from_numpy(all_parts["eta"].values).unsqueeze(0)
-        targets["all_phis"] = torch.from_numpy(all_parts["phi"].values).unsqueeze(0)
-        targets["all_vzs"] = torch.from_numpy(all_parts["vz"].values).unsqueeze(0)
-        targets["all_nhits"] = torch.from_numpy(all_parts["nhits"].values).unsqueeze(0)
+        targets["eval_hit_pid"] = torch.from_numpy(hits["particle_id"].values).unsqueeze(0)
+        targets["eval_hit_phi"] = torch.from_numpy(hits["phi"].values).unsqueeze(0)
+        targets["eval_hit_hid"] = torch.from_numpy(hits["hit_id"].values).unsqueeze(0)
+        targets["eval_hit_weight"] = torch.from_numpy(hits["weight"].values).unsqueeze(0)
+        targets["eval_truth_particle_id"] = torch.from_numpy(truth["particle_id"].values).unsqueeze(0)
+        targets["eval_truth_hit_id"] = torch.from_numpy(truth["hit_id"].values).unsqueeze(0)
+        targets["eval_truth_weight"] = torch.from_numpy(truth["weight"].values).unsqueeze(0)
+        targets["eval_all_pids"] = torch.from_numpy(all_parts["particle_id"].values).unsqueeze(0)
+        targets["eval_all_pts"] = torch.from_numpy(all_parts["pt"].values).unsqueeze(0)
+        targets["eval_all_etas"] = torch.from_numpy(all_parts["eta"].values).unsqueeze(0)
+        targets["eval_all_phis"] = torch.from_numpy(all_parts["phi"].values).unsqueeze(0)
+        targets["eval_all_vzs"] = torch.from_numpy(all_parts["vz"].values).unsqueeze(0)
+        targets["eval_all_nhits"] = torch.from_numpy(all_parts["nhits"].values).unsqueeze(0)
 
         # Build the regression targets
         if "particle" in self.targets:
@@ -198,26 +191,16 @@ class TrackMLDataset(Dataset):
 
         # If a hit eval file was specified, read in the predictions from it to use the hit filtering
         if self.hit_eval_path:
-                # assert str(self.sample_ids[idx]) in hit_eval_file, f"Key {self.sample_ids[idx]} not found in file {self.hit_eval_path}"
+            with h5py.File(self.hit_eval_path, "r") as hit_eval_file:
+                assert str(self.sample_ids[idx]) in hit_eval_file, f"Key {self.sample_ids[idx]} not found in file {self.hit_eval_path}"
 
-                # if using a hit selection model, load the hit selection model predictions
-                if self.use_old_hit_eval:
-                    g = self.hit_eval_file[f"event0000{self.sample_ids[idx]}"]
-                    hit_prob = torch.tensor(g["hit_pred"][:]).half().sigmoid().squeeze().numpy()
-                    hit_pred = hit_prob > 0.1
-                    # unsort the predictions (we haven't sorted the hits yet but the predictions are sorted)
-                    phi = np.arctan2(hits["y"], hits["x"])
-                    sort_idx = np.argsort(phi)
-                    hits = hits[hit_pred[np.argsort(sort_idx)]]
-                
+                # The dataset has shape (1, num_hits)
+                hit_filter_eval = hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/"]
+                if "hit_on_valid_particle" in hit_filter_eval.keys():
+                    hit_filter_pred = hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/hit_on_valid_particle"][0]
                 else:
-                    # The dataset has shape (1, num_hits)
-                    hit_filter_eval = self.hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/"]
-                    if "hit_on_valid_particle" in hit_filter_eval.keys():
-                        hit_filter_pred = self.hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/hit_on_valid_particle"][0]
-                    else:
-                        hit_filter_pred = self.hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/key_on_valid_particle"][0]
-                    hits = hits[hit_filter_pred]
+                    hit_filter_pred = hit_eval_file[f"{self.sample_ids[idx]}/preds/final/hit_filter/key_on_valid_particle"][0]
+                hits = hits[hit_filter_pred]
 
         # Add extra particle fields
         particles["p"] = np.sqrt(particles["px"] ** 2 + particles["py"] ** 2 + particles["pz"] ** 2)
@@ -262,6 +245,9 @@ class TrackMLDataset(Dataset):
         assert len(particles) != 0, "No particles remaining - loosen selection!"
         assert len(hits) != 0, "No hits remaining - loosen selection!"
         assert particles["particle_id"].nunique() == len(particles), "Non-unique particle ids"
+
+        # sort hits by phi
+        hits = hits.sort_values("phi")
 
         # Check that all hits have different phi
         # This is necessary as the fast sorting algorithm used by pytorch can be non-stable

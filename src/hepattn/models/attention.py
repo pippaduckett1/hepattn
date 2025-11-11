@@ -10,8 +10,8 @@ except ImportError:
         # FA2 (from wheel)
         from flash_attn import flash_attn_func, flash_attn_varlen_func  # ty: ignore [unresolved-import]
     except ImportError:
-        flash_attn_func = None  # ty: ignore [conflicting-declarations]
-        flash_attn_varlen_func = None  # ty: ignore [conflicting-declarations]
+        flash_attn_func = None
+        flash_attn_varlen_func = None
 
 from torch import Size, Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask, _score_mod_signature, flex_attention
@@ -143,7 +143,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.attn_type = attn_type
-        self.window_size = None
+        self.window_size = window_size
         self.qkv_norm = qkv_norm
         self.value_residual = value_residual
         self.is_first_layer = is_first_layer
@@ -322,9 +322,6 @@ class Attention(nn.Module):
 
         # Fused attention
         if self.attn_type == "flex":
-            assert isinstance(attn_mask, BlockMask) or attn_mask is None, "Flex attention requires a BlockMask for attention masking."
-            assert not kv_mask, "Flex attention with key/value padding masks is not supported yet."
-            assert q.shape[0] == 1, "Flex attention currently only supports batch size of 1."
             # TODO: Should block_mask be an argument separate from attn_mask to simplify things?
             out = self.attn(q, k, v, block_mask=attn_mask, score_mod=score_mod)
 
