@@ -39,6 +39,16 @@ class MaskFormerDecoder(nn.Module):
         phi_shift: float = 0.0,
         combine_ma_lca: str | None = None,
         change_if_none_then_all: bool = False,
+        use_first_layer_mask_only: bool  = False,
+        every_other_layer: bool = False,
+        no_if_none_then_all: bool = False,
+        add_direct_pe_in_layer: bool = True,
+        add_pe_pre_layer: bool = False,
+        add_pe_in_attn: bool = True,
+        learn_phi_shift: bool = False,
+        flipped: bool = False,
+        phi_shift_from_key_phi: bool = False,
+        log_query_phi: bool = True,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -61,6 +71,7 @@ class MaskFormerDecoder(nn.Module):
 
         self.decoder_layers = nn.ModuleList([MaskFormerDecoderLayer(depth=i, **decoder_layer_config) for i in range(num_decoder_layers)])
         self.dim = decoder_layer_config["dim"]
+        self.bidirectional_ca = decoder_layer_config.get("bidirectional_ca", True)
         self.tasks: list | None = None  # Will be set by MaskFormer
         self.num_queries = num_queries
         self.mask_attention = mask_attention
@@ -76,6 +87,25 @@ class MaskFormerDecoder(nn.Module):
         self.block_size = block_size
         self.phi_shift = phi_shift
         self.change_if_none_then_all = change_if_none_then_all
+        self.use_first_layer_mask_only = use_first_layer_mask_only
+        self.no_if_none_then_all = no_if_none_then_all
+        self.every_other_layer = every_other_layer
+
+        self.add_direct_pe_in_layer = add_direct_pe_in_layer
+        self.add_pe_pre_layer = add_pe_pre_layer
+        self.add_pe_in_attn = add_pe_in_attn
+
+        self.flipped = flipped
+        self.phi_shift_from_key_phi = phi_shift_from_key_phi
+        self.log_query_phi = log_query_phi
+
+        if learn_phi_shift:
+            # learned scalar in radians fraction (same semantics as before: subtracted inside 2*pi*(.. - phi_shift))
+            self.phi_shift = nn.Parameter(torch.tensor(float(phi_shift)))
+        else:
+            # keep it constant but device/dtype aware
+            self.register_buffer("phi_shift_buffer", torch.tensor(float(phi_shift)), persistent=True)
+            self.phi_shift = self.phi_shift_buffer
 
 
         if self.local_strided_attn:
@@ -120,7 +150,7 @@ class MaskFormerDecoder(nn.Module):
         if self.local_strided_attn:
             assert x["query_embed"].shape[0] == 1, "Local strided attention only supports batch size 1"
             if (self.attn_type == "torch") or (self.mask_attention):
-                attn_mask_lca = auto_local_ca_mask(x["query_embed"], x["key_embed"], self.window_size, wrap=self.window_wrap)
+                attn_mask_lca = auto_local_ca_mask(x["query_embed"], x["key_embed"], self.window_size, wrap=self.window_wrap, flipped=self.flipped)
             elif self.attn_type == "flex":
                 device = x["query_embed"].device
                 q_len = x["query_embed"].shape[1]
@@ -135,19 +165,36 @@ class MaskFormerDecoder(nn.Module):
                         device=device,
                         wrap=self.window_wrap,
                         dtype_float=dtype_float,
+                
                     )
                 else:
                     attn_mask_lca = self.flex_local_ca_mask(q_len, kv_len, device)
-                attn_mask_transpose = transpose_blockmask(attn_mask_lca, q_tokens=q_len, kv_tokens=kv_len, dev=device)
+                if self.bidirectional_ca:
+                    attn_mask_transpose = transpose_blockmask(attn_mask_lca, q_tokens=q_len, kv_tokens=kv_len, dev=device)
+
+
+        if self.add_pe_pre_layer:
+                x["query_embed"] = x["query_embed"] + x["query_posenc"]
+                x["key_embed"] = x["key_embed"] + x["key_posenc"]
+
 
         outputs: dict[str, dict] = {}
         for layer_index, decoder_layer in enumerate(self.decoder_layers):
             outputs[f"layer_{layer_index}"] = {}
+            if self.log_query_phi and "query_phi" in x:
+                outputs[f"layer_{layer_index}"]["query_phi"] = x["query_phi"].detach().clone()
 
             # if maskattention, PE should be added before generating the mask
-            if self.posenc and self.mask_attention:
+            if self.posenc and self.mask_attention and self.add_direct_pe_in_layer:
                 x["query_embed"] = x["query_embed"] + x["query_posenc"]
                 x["key_embed"] = x["key_embed"] + x["key_posenc"]
+
+            if self.use_first_layer_mask_only:
+                compute_attn_mask = layer_index == 0
+            elif self.every_other_layer:
+                compute_attn_mask = not (layer_index % 2 == 0)
+            else:
+                compute_attn_mask = True
 
             attn_masks: dict[str, torch.Tensor] = {}
             query_mask = None
@@ -165,28 +212,36 @@ class MaskFormerDecoder(nn.Module):
                 # Update x with task outputs for downstream use
                 if isinstance(task, IncidenceRegressionTask):
                     x["incidence"] = task_outputs[task.incidence_key].detach()
-                if isinstance(task, ObjectClassificationTask):
-                    x["class_probs"] = task_outputs[task.probs_key].detach()
 
                 outputs[f"layer_{layer_index}"][task.name] = task_outputs
 
-                # Collect attention masks from different tasks
-                task_attn_masks = task.attn_mask(task_outputs)
-                for input_name, task_attn_mask in task_attn_masks.items():
-                    if input_name in attn_masks:
-                        attn_masks[input_name] |= task_attn_mask
-                    else:
-                        attn_masks[input_name] = task_attn_mask
+                if (self.mask_attention or self.local_strided_attn) and compute_attn_mask:
+                    # Collect attention masks from different tasks
+                    task_attn_masks = task.attn_mask(task_outputs)
+                    for input_name, task_attn_mask in task_attn_masks.items():
+                        if input_name in attn_masks:
+                            attn_masks[input_name] |= task_attn_mask
+                        else:
+                            attn_masks[input_name] = task_attn_mask
 
-                # Collect query masks
-                if self.use_query_masks:
+                if isinstance(task, ObjectClassificationTask):
                     task_query_mask = task.query_mask(task_outputs)
                     if task_query_mask is not None:
                         query_mask = task_query_mask if query_mask is None else query_mask | task_query_mask
-                        x["query_mask"] = query_mask
+                        outputs[f"layer_{layer_index}"]["query_valid_mask"] = task_query_mask
+                        if self.use_query_masks:
+                            x["query_mask"] = query_mask
+
+                # Collect query masks
+                # if self.use_query_masks or self.change_if_none_then_all:
+                #     task_query_mask = task.query_mask(task_outputs)
+                #     if task_query_mask is not None:
+                #         query_mask = task_query_mask if query_mask is None else query_mask | task_query_mask
+                #         if self.use_query_masks:
+                #             x["query_mask"] = query_mask
 
             # Construct the full attention mask for MaskAttention decoder
-            if attn_masks and self.mask_attention:
+            if attn_masks and (self.mask_attention or self.local_strided_attn) and compute_attn_mask:
                 if self.unified_decoding:
                     # In merged input mode, tasks should return masks directly for the full merged tensor
                     # We expect only one mask key (likely "key" or similar) that covers all constituents
@@ -206,39 +261,24 @@ class MaskFormerDecoder(nn.Module):
                 # True values indicate a slot will be included in the attention computation, while False will be ignored.
                 # If the attn mask is completely invalid for a given query, allow it to attend everywhere
                 # TODO: check and see see if this is really necessary
+                outputs[f"layer_{layer_index}"]["attn_mask"] = attn_mask
 
-                if self.local_strided_attn and attn_mask_lca is not None:
+                if (self.local_strided_attn) and (attn_mask_lca is not None) and (self.combine_ma_lca):
                         # Both mask_attention and local_strided_attn are True, need to combine
                         if self.combine_ma_lca == "OR":
                             attn_mask = attn_mask | attn_mask_lca
-                            attn_mask = torch.where(torch.all(~attn_mask, dim=-1, keepdim=True), True, attn_mask)
-                        elif self.combine_ma_lca == "AND":
-                            attn_mask = torch.where(torch.all(~attn_mask, dim=-1, keepdim=True), True, attn_mask)
-                            attn_mask = attn_mask & attn_mask_lca
-                        else:
-                            raise ValueError("combine_ma_lca must be either OR or AND if both mask_attention and local_strided_attn are true.")
+
                 else:
-                    if self.change_if_none_then_all:
-                        assert query_mask is not None, "query mask must be set to use change if none then all"
-                        # Queries that currently have no allowed hits
-                        no_hits = torch.all(~attn_mask, dim=-1)  # [B, Q]
-                        # Only “fix” queries that are predicted true by the query mask
-                        # query_mask: [B, Q], True = track exists
-                        fix_queries = no_hits & query_mask        # [B, Q]
-                        # Broadcast over K dimension
-                        fix_queries = fix_queries.unsqueeze(-1)       # [B, Q, 1]
-                        # For those queries, set all hits to True; others unchanged
-                        attn_mask = torch.where(fix_queries, True, attn_mask_bool)
-                    else:
+                    if not self.no_if_none_then_all:
                         attn_mask = torch.where(torch.all(~attn_mask, dim=-1, keepdim=True), True, attn_mask)
 
-            elif (self.local_strided_attn) and (attn_mask_lca is not None):
-                attn_mask = attn_mask_lca
+                if (self.local_strided_attn) and (attn_mask_lca is not None) and (not self.mask_attention):
+                    attn_mask = attn_mask_lca
 
             if (attn_mask is not None):
-                if (self.attn_type != "flex"):
-                    outputs[f"layer_{layer_index}"]["attn_mask"] = attn_mask
-                elif torch.is_tensor(attn_mask):
+                # if (self.attn_type != "flex"):
+                    # outputs[f"layer_{layer_index}"]["attn_mask"] = attn_mask
+                if (self.attn_type == "flex") and torch.is_tensor(attn_mask):
                     outputs[f"layer_{layer_index}"]["attn_mask"] = attn_mask
 
                     B, Q_LEN, KV_LEN = attn_mask.shape
@@ -261,14 +301,15 @@ class MaskFormerDecoder(nn.Module):
                         # Call the original predicate with swapped indices.
                         return mask_mod(b, h, kv_idx, q_idx)
 
-                    attn_mask_transpose = create_block_mask(
-                        mask_mod_t,
-                        B=B,
-                        H=H,
-                        Q_LEN=KV_LEN,  # new queries = old KV tokens
-                        KV_LEN=Q_LEN,  # new keys    = old Q tokens
-                        device=attn_mask.device,
-                    )
+                    if self.bidirectional_ca:
+                        attn_mask_transpose = create_block_mask(
+                            mask_mod_t,
+                            B=B,
+                            H=H,
+                            Q_LEN=KV_LEN,  # new queries = old KV tokens
+                            KV_LEN=Q_LEN,  # new keys    = old Q tokens
+                            device=attn_mask.device,
+                        )
 
                     attn_mask = create_block_mask(
                         mask_mod,
@@ -287,8 +328,8 @@ class MaskFormerDecoder(nn.Module):
                 attn_mask=attn_mask,
                 q_mask=x.get("query_mask"),
                 kv_mask=x.get("key_valid"),
-                query_posenc=x["query_posenc"] if self.posenc else None,
-                key_posenc=x["key_posenc"] if self.posenc else None,
+                query_posenc=x["query_posenc"] if (self.posenc and self.add_pe_in_attn) else None,
+                key_posenc=x["key_posenc"] if (self.posenc and self.add_pe_in_attn) else None,
                 attn_mask_transpose=attn_mask_transpose,
             )
 
@@ -305,9 +346,22 @@ class MaskFormerDecoder(nn.Module):
         return window_mask_func(self.window_size, q_len=q_len, kv_len=kv_len, device=str(device))
 
     def generate_positional_encodings(self, x: dict):
-        phi_shift = torch.tensor(self.phi_shift, device=x["query_embed"].device, dtype=x["query_embed"].dtype)
-        idx = torch.arange(self.num_queries, device=x["query_embed"].device, dtype=x["query_embed"].dtype)
-        x["query_phi"] = 2 * torch.pi * (idx / self.num_queries - phi_shift)
+        device = x["query_embed"].device
+        dtype = x["query_embed"].dtype
+
+        idx = torch.arange(self.num_queries, device=device, dtype=dtype)
+
+        if self.phi_shift_from_key_phi:
+            if "key_phi" not in x:
+                raise ValueError("key_phi is required when phi_shift_from_key_phi is True")
+            min_key_phi = torch.amin(x["key_phi"], dim=-1, keepdim=True)
+            denom = max(self.num_queries - 1, 1)
+            span_fraction = idx / denom
+            x["query_phi"] = min_key_phi + 2 * torch.pi * span_fraction
+        else:
+            query_fraction = idx / self.num_queries
+            phi_shift = torch.tensor(self.phi_shift, device=device, dtype=dtype)
+            x["query_phi"] = 2 * torch.pi * (query_fraction - phi_shift - 0.5)
 
         query_posenc = pos_enc_symmetric(x["query_phi"], self.dim, self.posenc["alpha"], self.posenc["base"])
         key_posenc = pos_enc_symmetric(x["key_phi"], self.dim, self.posenc["alpha"], self.posenc["base"])
@@ -326,6 +380,7 @@ class MaskFormerDecoderLayer(nn.Module):
         qkv_norm: bool = False,
         hybrid_norm: bool = False,
         sa_pe: bool = False,
+        scale_pe: float = 1.0
     ) -> None:
         """Initialize a MaskFormer decoder layer.
 
@@ -344,6 +399,7 @@ class MaskFormerDecoderLayer(nn.Module):
         self.dim = dim
         self.bidirectional_ca = bidirectional_ca
         self.sa_pe = sa_pe
+        self.scale_pe = scale_pe
 
         attn_norm, dense_post_norm, qkv_norm = get_hybrid_norm_config(norm, depth, hybrid_norm, qkv_norm)
 
@@ -388,14 +444,14 @@ class MaskFormerDecoderLayer(nn.Module):
                 - The updated query embeddings (Tensor).
                 - The updated key/value embeddings (Tensor).
         """
-        q_pe = q if query_posenc is None else q + query_posenc
-        kv_pe = kv if key_posenc is None else kv + key_posenc
+        q_pe = q if query_posenc is None else q + self.scale_pe * query_posenc
+        kv_pe = kv if key_posenc is None else kv + self.scale_pe * key_posenc
 
         q = self.q_ca(q_pe, k=kv_pe, v=kv, attn_mask=attn_mask, q_mask=q_mask, kv_mask=kv_mask)
         q = self.q_dense(q)
 
         if self.sa_pe:
-            q_pe = q if query_posenc is None else q + query_posenc
+            q_pe = q if query_posenc is None else q + self.scale_pe * query_posenc
             q = self.q_sa(q_pe, k=q_pe, v=q, q_mask=q_mask)
         else:
             q = self.q_sa(q, k=q, v=q, q_mask=q_mask)
@@ -408,8 +464,8 @@ class MaskFormerDecoderLayer(nn.Module):
                 # Index from the back so we are batch shape agnostic
                 attn_mask = attn_mask_transpose if attn_mask_transpose is not None else attn_mask.transpose(-2, -1)
 
-            q_pe = q if query_posenc is None else q + query_posenc
-            kv_pe = kv if key_posenc is None else kv + key_posenc
+            q_pe = q if query_posenc is None else q + self.scale_pe * query_posenc
+            kv_pe = kv if key_posenc is None else kv + self.scale_pe * key_posenc
 
             kv = self.kv_ca(kv_pe, k=q_pe, v=q, attn_mask=attn_mask, q_mask=kv_mask, kv_mask=q_mask)
             kv = self.kv_dense(kv)

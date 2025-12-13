@@ -20,6 +20,8 @@ class AttnMaskLogger(Callback):
         log_every_n_batches: int = 1000,
         lca_window_sizes: list[int] | None = None,
         log_diagonal_metrics: bool = True,
+        log_invalid_query_phi: bool = False,
+        invalid_query_phi_bins: int = 64,
     ):
         super().__init__()
         self.log_train = log_train
@@ -28,6 +30,8 @@ class AttnMaskLogger(Callback):
         self.log_every_n_batches = log_every_n_batches
         self.lca_window_sizes = lca_window_sizes if lca_window_sizes is not None else [32, 64, 128, 512, 1024, 2048]
         self.log_diagonal_metrics = log_diagonal_metrics
+        self.log_invalid_query_phi = log_invalid_query_phi
+        self.invalid_query_phi_bins = invalid_query_phi_bins
 
     def _log_attention_mask(self, pl_module, mask, step, layer, prefix="local_ca_mask"):
         """Helper method to create and log attention mask figures."""
@@ -73,6 +77,36 @@ class AttnMaskLogger(Callback):
                 print(f"[AttnMaskLogger] Step {step} Layer {layer} - Avg hits per query: {avg_hits_per_query}")
         except (ValueError, AttributeError, TypeError) as e:
             print(f"[AttnMaskLogger] Error logging attention stats: {e}")
+
+    def _log_invalid_query_phi_distribution(self, pl_module, query_phi, valid_mask, step, layer, prefix):
+        query_phi = query_phi.detach().cpu()
+        valid_mask = valid_mask.detach().cpu()
+        invalid_phi = query_phi[~valid_mask]
+
+        fig, ax = plt.subplots(constrained_layout=True, dpi=300)
+        if invalid_phi.numel() == 0:
+            ax.text(0.5, 0.5, "No invalid queries", ha="center", va="center")
+            ax.set_xlabel("Query φ")
+            ax.set_ylabel("Count")
+        else:
+            ax.hist(
+                invalid_phi.numpy(),
+                bins=self.invalid_query_phi_bins,
+                color="#1f77b4",
+                edgecolor="black",
+            )
+            ax.set_xlabel("Query φ")
+            ax.set_ylabel("Invalid query count")
+        ax.set_title(f"Invalid Query φ - Step {step}, Layer {layer}")
+
+        logger = getattr(pl_module, "logger", None)
+        if logger is not None and hasattr(logger, "experiment"):
+            logger.experiment.log_figure(
+                figure_name=f"{prefix}_invalid_query_phi_step{step}_layer{layer}",
+                figure=fig,
+                step=step,
+            )
+        plt.close(fig)
 
     def _calculate_multi_lca_comparison_metrics(self, ma_mask):
         """Calculate LCA comparison metrics for multiple window sizes using dummy embeddings."""
@@ -256,6 +290,19 @@ class AttnMaskLogger(Callback):
                     # Log diagonal metrics if enabled
                     if self.log_diagonal_metrics:
                         self._log_diagonal_metrics(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
+
+                    if self.log_invalid_query_phi:
+                        query_phi = l_out.get("query_phi")
+                        valid_mask = l_out.get("query_valid_mask")
+                        if query_phi is not None and valid_mask is not None:
+                            self._log_invalid_query_phi_distribution(
+                                pl_module,
+                                query_phi,
+                                valid_mask,
+                                step,
+                                layer_index,
+                                f"local_ma_mask_{prefix_suffix}",
+                            )
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         if not self.log_val:
