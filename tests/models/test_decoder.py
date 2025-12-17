@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from hepattn.models.decoder import MaskFormerDecoder, MaskFormerDecoderLayer
+from hepattn.utils.local_ca import auto_local_ca_mask, get_local_ca_mask
 
 BATCH_SIZE = 2
 SEQ_LEN = 10
@@ -85,6 +86,22 @@ class TestMaskFormerDecoder:
             num_decoder_layers=NUM_LAYERS,
             mask_attention=False,  # Must be False when local_strided_attn=True
             local_strided_attn=True,
+            window_size=4,
+            window_wrap=True,
+        )
+
+    @pytest.fixture
+    def decoder_local_strided_attn_decay(self, decoder_layer_config):
+        """Decoder with local_strided_attn=True and exponential decay bias."""
+        config = decoder_layer_config.copy()
+        return MaskFormerDecoder(
+            num_queries=NUM_QUERIES,
+            decoder_layer_config=config,
+            num_decoder_layers=NUM_LAYERS,
+            mask_attention=False,
+            local_strided_attn=True,
+            local_strided_decay=True,
+            local_strided_decay_tau=1.0,
             window_size=4,
             window_wrap=True,
         )
@@ -192,6 +209,37 @@ class TestMaskFormerDecoder:
             assert attn_mask.shape == (1, NUM_QUERIES, SEQ_LEN)
             assert attn_mask.dtype == torch.bool
 
+    def test_local_strided_attn_decay_bias(self, decoder_local_strided_attn_decay, sample_local_strided_decoder_data):
+        """Ensure decay bias tensor is produced when local_strided_decay=True."""
+        x, input_names = sample_local_strided_decoder_data
+        decoder_local_strided_attn_decay.tasks = []
+
+        _, outputs = decoder_local_strided_attn_decay(x, input_names)
+        attn_bias = outputs["layer_0"].get("attn_bias")
+        assert attn_bias is not None
+        assert attn_bias.shape == (1, NUM_QUERIES, SEQ_LEN)
+        assert torch.isclose(attn_bias.max(), torch.tensor(0.0), atol=1e-6)
+        assert attn_bias.min() < -1e-3
+
+    def test_local_strided_first_layer_window_size(self, decoder_layer_config, sample_local_strided_decoder_data):
+        """Verify first layer can use a wider LCA window than later layers."""
+        decoder = MaskFormerDecoder(
+            num_queries=NUM_QUERIES,
+            decoder_layer_config=decoder_layer_config,
+            num_decoder_layers=NUM_LAYERS,
+            mask_attention=False,
+            local_strided_attn=True,
+            window_size=2,
+            local_strided_first_layer_window_size=6,
+            window_wrap=True,
+        )
+        decoder.tasks = []
+        x, input_names = sample_local_strided_decoder_data
+        _, outputs = decoder(x, input_names)
+        layer0_mask = outputs["layer_0"]["lca_mask"]
+        layer1_mask = outputs["layer_1"]["lca_mask"]
+        assert layer0_mask.sum() > layer1_mask.sum()
+
     def test_forward_shapes(self, decoder_no_mask_attention, sample_decoder_data):
         """Test that forward pass maintains correct tensor shapes."""
         x, input_names = sample_decoder_data
@@ -268,6 +316,106 @@ class TestMaskFormerDecoder:
             assert attn_mask[1, 0, 1]  # becomes True
             assert not attn_mask[0, 1, 3]
             assert not attn_mask[1, 4, 5]
+
+    def test_phi_distance_mask_without_local_attn(self, decoder_layer_config):
+        """Ensure phi-distance masking works without mask attention or LCA."""
+        config = decoder_layer_config.copy()
+        config["bidirectional_ca"] = False
+        config["attn_kwargs"] = {"attn_type": "torch"}
+        decoder = MaskFormerDecoder(
+            num_queries=2,
+            decoder_layer_config=config,
+            num_decoder_layers=1,
+            mask_attention=False,
+            local_strided_attn=False,
+            unified_decoding=True,
+            use_phi_distance_mask=True,
+            phi_distance_threshold=0.15,
+        )
+        decoder.tasks = []
+        key_phi = torch.tensor([[0.0, 0.1, 1.0, 2.5]])
+        query_phi = torch.tensor([[0.05, 2.45]])
+        x = {
+            "key_embed": torch.randn(1, key_phi.shape[-1], DIM),
+            "key_valid": torch.ones(1, key_phi.shape[-1], dtype=torch.bool),
+            "key_phi": key_phi,
+            "query_phi": query_phi,
+        }
+        expected_mask = decoder.compute_phi_distance_mask({"key_phi": key_phi, "query_phi": query_phi})
+        _, outputs = decoder(x, ["hit"])
+        attn_mask = outputs["layer_0"]["attn_mask"]
+        assert attn_mask is not None
+        assert torch.equal(attn_mask, expected_mask)
+
+    def test_phi_distance_mask_combines_with_lca(self, decoder_layer_config):
+        """Verify phi-distance mask is OR'd with the LCA stencil."""
+        config = decoder_layer_config.copy()
+        config["attn_kwargs"] = {"attn_type": "torch"}
+        decoder = MaskFormerDecoder(
+            num_queries=2,
+            decoder_layer_config=config,
+            num_decoder_layers=1,
+            mask_attention=False,
+            local_strided_attn=True,
+            window_size=2,
+            window_wrap=True,
+            unified_decoding=True,
+            use_phi_distance_mask=True,
+            phi_distance_threshold=0.2,
+        )
+        decoder.tasks = []
+        key_phi = torch.tensor([[0.0, 0.15, 0.3, 2.6, 2.8, 3.0]])
+        query_phi = torch.tensor([[0.05, 2.7]])
+        num_hits = key_phi.shape[-1]
+        x = {
+            "key_embed": torch.randn(1, num_hits, DIM),
+            "key_valid": torch.ones(1, num_hits, dtype=torch.bool),
+            "key_phi": key_phi,
+            "query_phi": query_phi,
+        }
+        phi_mask = decoder.compute_phi_distance_mask({"key_phi": key_phi, "query_phi": query_phi})
+        stride = num_hits / decoder.num_queries
+        lca_mask = get_local_ca_mask(decoder.num_queries, num_hits, decoder.window_size, stride=stride, device=x["key_embed"].device, wrap=decoder.window_wrap).unsqueeze(0)
+        expected_mask = phi_mask | lca_mask
+        _, outputs = decoder(x, ["hit"])
+        attn_mask = outputs["layer_0"]["attn_mask"]
+        assert attn_mask is not None
+        assert torch.equal(attn_mask, expected_mask)
+
+    def test_phi_distance_mask_combines_with_large_lca(self, decoder_layer_config):
+        """Same as above but with a wide (1024) LCA window to match TrackML configs."""
+        config = decoder_layer_config.copy()
+        config["attn_kwargs"] = {"attn_type": "torch"}
+        num_queries = 8
+        num_hits = 2048
+        decoder = MaskFormerDecoder(
+            num_queries=num_queries,
+            decoder_layer_config=config,
+            num_decoder_layers=1,
+            mask_attention=False,
+            local_strided_attn=True,
+            window_size=1024,
+            window_wrap=True,
+            unified_decoding=True,
+            use_phi_distance_mask=True,
+            phi_distance_threshold=0.05,
+        )
+        decoder.tasks = []
+        key_phi = torch.linspace(-torch.pi, torch.pi, num_hits).unsqueeze(0)
+        query_phi = torch.linspace(-torch.pi, torch.pi, num_queries).unsqueeze(0)
+        x = {
+            "key_embed": torch.randn(1, num_hits, DIM),
+            "key_valid": torch.ones(1, num_hits, dtype=torch.bool),
+            "key_phi": key_phi,
+            "query_phi": query_phi,
+        }
+        phi_mask = decoder.compute_phi_distance_mask({"key_phi": key_phi, "query_phi": query_phi})
+        lca_mask = auto_local_ca_mask(torch.zeros(1, num_queries, 1), torch.zeros(1, num_hits, 1), window_size=decoder.window_size, wrap=True)
+        expected_mask = phi_mask | lca_mask
+        _, outputs = decoder(x, ["hit"])
+        attn_mask = outputs["layer_0"]["attn_mask"]
+        assert attn_mask is not None
+        assert torch.equal(attn_mask, expected_mask)
 
 
 class TestMaskFormerDecoderLayer:

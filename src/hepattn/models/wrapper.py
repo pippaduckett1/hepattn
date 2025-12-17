@@ -18,6 +18,7 @@ class ModelWrapper(LightningModule):
         lrs_config: dict,
         optimizer: Literal["AdamW", "Lion"] = "AdamW",
         mtl: bool = False,
+        log_phi_distributions: bool = False,
     ):
         super().__init__()
 
@@ -28,6 +29,7 @@ class ModelWrapper(LightningModule):
         self.optimizer = optimizer
         self.lrs_config = lrs_config
         self.mtl = mtl
+        self.log_phi_distributions = log_phi_distributions
 
         if mtl:
             # Donated buffers can cause issues with graph retention needed for MTL
@@ -102,7 +104,10 @@ class ModelWrapper(LightningModule):
             self.mlt_opt(losses, outputs)
             return None
         total_loss = self.aggregate_losses(losses, stage="train")
-        return {"loss": total_loss, **outputs}
+        result = {"loss": total_loss, **outputs}
+        if self.log_phi_distributions:
+            result["diagnostics"] = self._collect_phi_diagnostics(inputs, targets)
+        return result
 
     def validation_step(self, batch: tuple[dict[str, Tensor], dict[str, Tensor]]) -> dict[str, Tensor]:
         inputs, targets = batch
@@ -165,6 +170,16 @@ class ModelWrapper(LightningModule):
 
         print("Skipping learning rate scheduler.")
         return opt
+
+    def _collect_phi_diagnostics(self, inputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        diagnostics: dict[str, Tensor] = {}
+        for key in ("hit_phi", "hit_valid"):
+            if key in inputs:
+                diagnostics[key] = inputs[key].detach()
+        for key in ("particle_phi", "particle_valid"):
+            if key in targets:
+                diagnostics[key] = targets[key].detach()
+        return diagnostics
 
     def mlt_opt(self, losses: dict[str, Tensor], outputs: dict[str, Tensor]) -> None:
         opt = self.optimizers()

@@ -16,8 +16,9 @@ class TrackMLTracker(ModelWrapper):
         lrs_config: dict,
         optimizer: str = "AdamW",
         mtl: bool = False,
+        log_phi_distributions: bool = False,
     ):
-        super().__init__(name, model, lrs_config, optimizer, mtl)
+        super().__init__(name, model, lrs_config, optimizer, mtl, log_phi_distributions)
 
     def log_custom_metrics(self, preds, targets, stage):
         # log intermediate layer mask predictions
@@ -86,6 +87,7 @@ def main(args: ArgsType = None) -> None:
         datamodule_class=TrackMLDataModule,
         args=args,
         parser_kwargs={"default_env": True},
+        save_config_kwargs={"overwrite": True},
     )
 
 

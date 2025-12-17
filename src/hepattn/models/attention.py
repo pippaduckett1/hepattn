@@ -391,6 +391,8 @@ class Attention(nn.Module):
 
             if attn_bias is not None:
                 # Torch expects the head dim first so have to permute
+                if attn_bias.dim() == 3:
+                    attn_bias = attn_bias.unsqueeze(-1)
                 attn_bias = attn_bias.permute(0, 3, 1, 2)
 
                 # Combine the bias with the attention mask if both are specified

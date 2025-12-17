@@ -237,9 +237,6 @@ class ObjectClassificationTask(Task):
         return losses
 
     def query_mask(self, outputs: dict[str, Tensor], threshold: float = 0.1) -> Tensor | None:
-        if not self.mask_queries:
-            return None
-
         class_probs = outputs[self.output_object + "_class_prob"].detach()
         return class_probs[..., -1] <= (1 - threshold)
 
@@ -345,6 +342,7 @@ class ObjectHitMaskTask(Task):
         predict_iou: bool = False,
         iou_loss_weight: float = 1.0,
         has_intermediate_loss: bool = True,
+        log_unmasked_logits: bool = False,
     ):
         """Task for predicting associations between objects and hits.
 
@@ -370,6 +368,7 @@ class ObjectHitMaskTask(Task):
             predict_iou: Whether to predict the IoU of the predicted mask.
             iou_loss_weight: Weight for the IoU loss.
             has_intermediate_loss: Whether the task has intermediate loss.
+            log_unmasked_logits: Whether to keep a copy of logits before masking invalid constituents.
         """
         super().__init__(has_intermediate_loss=has_intermediate_loss)
 
@@ -393,6 +392,7 @@ class ObjectHitMaskTask(Task):
         self.predict_iou = predict_iou
         self.iou_loss_weight = iou_loss_weight
         self.has_intermediate_loss = mask_attn or predict_iou
+        self.log_unmasked_logits = log_unmasked_logits
 
         if self.predict_iou:
             self.iou_net = Dense(dim, 1)
@@ -413,14 +413,20 @@ class ObjectHitMaskTask(Task):
             xs = self.constituent_net(xs)
 
         # Object-hit probability is the dot product between the hit and object embedding
-        object_hit_logit = self.logit_scale * torch.einsum("bnc,bmc->bnm", mask_tokens, xs)
+        raw_logits = self.logit_scale * torch.einsum("bnc,bmc->bnm", mask_tokens, xs)
+        outputs = {}
+        if self.log_unmasked_logits:
+            outputs[self.output_object_hit + "_logit_unmasked"] = raw_logits.detach().clone()
+        object_hit_logit = raw_logits
 
         # Zero out entries for any padded input constituents
         if (valid_mask := x[f"{self.input_constituent}_valid"]) is not None:
             valid_mask = valid_mask.unsqueeze(-2).expand_as(object_hit_logit)
             object_hit_logit[~valid_mask] = torch.finfo(object_hit_logit.dtype).min
 
-        outputs = {self.output_object_hit + "_logit": object_hit_logit}
+        outputs[self.output_object_hit + "_logit"] = object_hit_logit
+        if self.log_unmasked_logits:
+            outputs[self.output_object_hit + "_logit_unmasked"] = raw_logits.detach().clone()
 
         if self.predict_iou:
             outputs[self.output_object + "_iou_logit"] = self.iou_net(x[self.input_object + "_embed"]).squeeze(-1)

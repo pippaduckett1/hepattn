@@ -1,0 +1,365 @@
+# lightning.pytorch==2.5.2
+seed_everything: 42
+trainer:
+  accelerator: gpu
+  strategy: auto
+  devices: '1'
+  num_nodes: 1
+  precision: bf16-mixed
+  logger:
+    class_path: hepattn.utils.loggers.MyCometLogger
+    init_args:
+      offline_directory: /lus/lfs1aip2/projects/u5du/pduckett/hepattn-pr-exp/logs/TRK-v0-diagnostics-maskattention-alllayers_20251214-T000436
+      log_env_details: true
+      api_key: null
+      workspace: null
+      project: trackml_tracking
+      experiment_key: null
+      mode: null
+      online: null
+      prefix: null
+  callbacks:
+  - class_path: hepattn.callbacks.InferenceTimer
+  - class_path: hepattn.callbacks.SaveConfig
+  - class_path: hepattn.callbacks.AttnMaskLogger
+    init_args:
+      log_train: true
+      log_val: true
+      log_stats: true
+      log_every_n_batches: 1000
+      lca_window_sizes: null
+      log_diagonal_metrics: true
+      log_invalid_query_phi: true
+      invalid_query_phi_bins: 64
+      log_query_phi_metrics: true
+      log_diagonal_regression: true
+      log_phi_distance_mask: true
+      phi_distance_threshold: 0.2
+      log_query_vs_truth_phi: true
+      log_predicted_masks: true
+      predicted_mask_threshold: 0.5
+      log_all_layers: true
+  - class_path: hepattn.callbacks.Checkpoint
+    init_args:
+      monitor: val/loss
+      log_model: true
+      dirpath: null
+      verbose: false
+      save_last: null
+      save_weights_only: false
+      mode: min
+      every_n_train_steps: null
+      train_time_interval: null
+      every_n_epochs: null
+      save_on_train_epoch_end: null
+      enable_version_counter: true
+  - class_path: hepattn.callbacks.PredictionWriter
+    init_args:
+      write_inputs: false
+      write_outputs: true
+      write_preds: true
+      write_targets: true
+      write_losses: false
+      write_layers: null
+  - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    init_args:
+      logging_interval: null
+      log_momentum: false
+      log_weight_decay: false
+  - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+    init_args:
+      refresh_rate: 50
+      process_position: 0
+      leave: false
+  fast_dev_run: false
+  max_epochs: 10
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: 50
+  enable_checkpointing: null
+  enable_progress_bar: true
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: /lus/lfs1aip2/projects/u5du/pduckett/hepattn-pr-exp/logs/TRK-v0-diagnostics-maskattention-alllayers_20251214-T000436
+  model_registry: null
+model:
+  model:
+    class_path: hepattn.models.MaskFormer
+    init_args:
+      input_nets:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+          - class_path: hepattn.models.InputNet
+            init_args:
+              input_name: hit
+              net:
+                class_path: hepattn.models.Dense
+                init_args:
+                  input_size: 17
+                  output_size: 256
+                  hidden_layers:
+                  - 128
+                  hidden_dim_scale: 2
+                  activation:
+                    class_path: hepattn.models.SwiGLU
+                  final_activation: null
+                  dropout: 0.0
+                  bias: true
+              fields:
+              - x
+              - y
+              - z
+              - r
+              - eta
+              - phi
+              - u
+              - v
+              - s
+              - charge_frac
+              - leta
+              - lphi
+              - lx
+              - ly
+              - lz
+              - geta
+              - gphi
+              posenc:
+                class_path: hepattn.models.PositionEncoder
+                init_args:
+                  input_name: hit
+                  fields:
+                  - r
+                  - eta
+                  - phi
+                  dim: 256
+                  sym_fields: null
+                  alpha: 1000
+                  base: 100
+              input_dtype: null
+      encoder:
+        class_path: hepattn.models.Encoder
+        init_args:
+          num_layers: 12
+          dim: 256
+          attn_type: flash
+          window_size: 512
+          window_wrap: true
+          score_mod: null
+          value_residual: false
+          num_register_tokens: null
+          attn_kwargs: null
+          norm: RMSNorm
+          layer_scale: null
+          drop_path: 0.0
+          qkv_norm: false
+          hybrid_norm: true
+          dense_kwargs:
+            activation: SwiGLU
+      decoder:
+        class_path: hepattn.models.MaskFormerDecoder
+        init_args:
+          num_queries: 2100
+          decoder_layer_config:
+            dim: 256
+            norm: RMSNorm
+            hybrid_norm: true
+            dense_kwargs:
+              activation: SwiGLU
+            attn_kwargs:
+              attn_type: torch
+            bidirectional_ca: false
+          num_decoder_layers: 8
+          mask_attention: true
+          use_query_masks: false
+          posenc:
+            alpha: 1.3
+            base: 50000.0
+          local_strided_attn: false
+          window_size: 512
+          window_wrap: true
+          fast_local_ca: false
+          block_size: 128
+          unified_decoding: false
+          phi_shift: -0.5
+          combine_ma_lca: null
+          change_if_none_then_all: false
+          use_first_layer_mask_only: false
+          every_other_layer: false
+          no_if_none_then_all: false
+          add_direct_pe_in_layer: false
+          add_pe_pre_layer: false
+          add_pe_in_attn: true
+          learn_phi_shift: false
+          flipped: false
+          phi_shift_from_key_phi: true
+          log_query_phi: true
+          log_key_phi: true
+      tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+          - class_path: hepattn.models.task.ObjectClassificationTask
+            init_args:
+              name: track_valid
+              input_object: query
+              output_object: track
+              target_object: particle
+              losses:
+                object_bce: 0.1
+              costs:
+                object_bce: 0.1
+              net: null
+              dim: 256
+              num_classes: 1
+              class_weights: null
+              null_weight: 1.0
+              mask_queries: false
+              has_intermediate_loss: true
+              has_first_layer_loss: false
+          - class_path: hepattn.models.task.ObjectHitMaskTask
+            init_args:
+              name: track_hit_valid
+              input_constituent: hit
+              input_object: query
+              output_object: track
+              target_object: particle
+              losses:
+                mask_dice: 2.0
+                mask_focal: 50.0
+              costs:
+                mask_dice: 2.0
+                mask_focal: 50.0
+              dim: 256
+              object_net: null
+              constituent_net: null
+              null_weight: 1.0
+              mask_attn: true
+              target_field: valid
+              logit_scale: 1.0
+              pred_threshold: 0.5
+              mask_attention_threshold: null
+              predict_iou: true
+              iou_loss_weight: 1.0
+              has_intermediate_loss: true
+          - class_path: hepattn.models.task.ObjectRegressionTask
+            init_args:
+              name: query_regression
+              input_object: query
+              output_object: track
+              target_object: particle
+              fields:
+              - px
+              - py
+              - pz
+              loss_weight: 0.1
+              cost_weight: 0.0
+              dim: 256
+              loss: smooth_l1
+              has_intermediate_loss: false
+      dim: 256
+      target_object: particle
+      pooling: null
+      matcher:
+        class_path: hepattn.models.matcher.Matcher
+        init_args:
+          default_solver: scipy
+          adaptive_solver: true
+          adaptive_check_interval: 1000
+          parallel_solver: false
+          n_jobs: 8
+          verbose: false
+      input_sort_field: null
+      sorter:
+        class_path: hepattn.utils.sorter.Sorter
+        init_args:
+          input_sort_field: phi
+      unified_decoding: false
+  lrs_config:
+    initial: 1.0e-05
+    max: 5.0e-05
+    end: 1.0e-05
+    pct_start: 0.05
+    skip_scheduler: false
+    weight_decay: 1.0e-05
+  optimizer: Lion
+  mtl: false
+  log_phi_distributions: true
+data:
+  train_dir: /projects/u5du/pduckett/data_new/train/
+  val_dir: /projects/u5du/pduckett/data_new/val/
+  num_workers: 10
+  num_train: -1
+  num_val: -1
+  num_test: -1
+  test_dir: /projects/u5du/pduckett/data_new/test/
+  pin_memory: true
+  hit_eval_train: /projects/u5du/pduckett/filter_evals/eta2p5pt600/epoch=100-val_loss=0.15778_train_eval.h5
+  hit_eval_val: /projects/u5du/pduckett/filter_evals/eta2p5pt600/epoch=100-val_loss=0.15778_val_eval.h5
+  hit_eval_test: /projects/u5du/pduckett/filter_evals/eta2p5pt600/epoch=100-val_loss=0.15778_test_eval.h5
+  inputs:
+    hit:
+    - x
+    - y
+    - z
+    - r
+    - s
+    - eta
+    - phi
+    - u
+    - v
+    - s
+    - charge_frac
+    - leta
+    - lphi
+    - lx
+    - ly
+    - lz
+    - geta
+    - gphi
+  targets:
+    particle:
+    - pt
+    - eta
+    - phi
+    - px
+    - py
+    - pz
+  hit_volume_ids:
+  - 7
+  - 8
+  - 9
+  feature_volume_ids: null
+  particle_min_pt: 0.6
+  particle_max_abs_eta: 2.5
+  particle_min_num_hits: 3
+  event_max_num_particles: 2100
+  strict_max_objects: false
+  dummy_data: false
+name: TRK-v0-diagnostics-queryPE-mask-alllayers
+matmul_precision: null
+optimizer: null
+lr_scheduler: null
+ckpt_path: null
