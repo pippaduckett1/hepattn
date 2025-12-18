@@ -72,6 +72,7 @@ class MaskFormerDecoder(nn.Module):
         phi_aware_transpose: bool = False,
         bidirectional_ca_start_layer: int | None = None,
         bidirectional_ca_use_key_values: bool = False,
+        bidirectional_ca_transpose_mode: str = "simple",
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -217,6 +218,19 @@ class MaskFormerDecoder(nn.Module):
             self.bidirectional_ca_start_layer = 0
         if self.phi_aware_transpose and not self.bidirectional_ca:
             raise ValueError("phi_aware_transpose requires bidirectional_ca to be True in decoder_layer_config")
+
+        # Transpose mode for bidirectional CA attention mask
+        # - "simple": standard transpose (current behavior)
+        # - "phi_aware": remap based on φ positions (uses phi_aware_transpose)
+        # - "direct_phi": compute K×Q mask directly from φ similarity, ignoring task mask
+        # - "scaled": scale indices to account for Q≠K aspect ratio
+        valid_transpose_modes = {"simple", "phi_aware", "direct_phi", "scaled"}
+        if bidirectional_ca_transpose_mode not in valid_transpose_modes:
+            raise ValueError(f"bidirectional_ca_transpose_mode must be one of {valid_transpose_modes}")
+        self.bidirectional_ca_transpose_mode = bidirectional_ca_transpose_mode
+        # For backwards compatibility, phi_aware_transpose=True overrides to "phi_aware" mode
+        if self.phi_aware_transpose:
+            self.bidirectional_ca_transpose_mode = "phi_aware"
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -467,19 +481,20 @@ class MaskFormerDecoder(nn.Module):
             if layer_attn_bias is not None and layer_attn_bias_transpose is None and torch.is_tensor(layer_attn_bias):
                 layer_attn_bias_transpose = layer_attn_bias.transpose(-2, -1)
 
-            # Compute phi-aware transpose if enabled (for torch attention with tensor masks)
+            # Compute bidirectional mask using the configured transpose mode (for torch attention with tensor masks)
             if (
-                self.phi_aware_transpose
+                self.bidirectional_ca_transpose_mode != "simple"
                 and layer_attn_mask is not None
                 and torch.is_tensor(layer_attn_mask)
                 and self.attn_type != "flex"
-                and "query_phi" in x
-                and "key_phi" in x
             ):
-                layer_attn_mask_transpose = self.compute_phi_aware_transpose_vectorized(
-                    layer_attn_mask, x["query_phi"], x["key_phi"]
+                layer_attn_mask_transpose = self.compute_bidirectional_mask(
+                    layer_attn_mask,
+                    x.get("query_phi"),
+                    x.get("key_phi"),
+                    mode=self.bidirectional_ca_transpose_mode,
                 )
-                # Update logging mask if phi-aware transpose is used
+                # Update logging mask for the bidirectional direction
                 if decoder_layer.bidirectional_ca:
                     kv_attn_mask_for_logging = layer_attn_mask_transpose.detach().clone()
 
@@ -871,6 +886,112 @@ class MaskFormerDecoder(nn.Module):
         transposed_mask = mask[batch_idx, k_to_q_idx, q_to_k_idx]
 
         return transposed_mask
+
+    def compute_direct_phi_mask(self, query_phi: torch.Tensor, key_phi: torch.Tensor, window_fraction: float = 0.1) -> torch.Tensor:
+        """Compute a K×Q attention mask directly from φ similarity.
+
+        This ignores the task-predicted mask entirely and creates a mask based purely
+        on φ proximity between keys and queries. Useful for bidirectional CA where
+        we want keys to attend to queries with similar φ.
+
+        Args:
+            query_phi: Query phi values of shape (B, Q).
+            key_phi: Key phi values of shape (B, K).
+            window_fraction: Fraction of 2π to use as the attention window (default 0.1 = ~36°).
+
+        Returns:
+            Mask of shape (B, K, Q) where mask[b, k, q] = 1 if |φ_k - φ_q| < threshold.
+        """
+        # Compute wrapped phi difference: key_phi[b, k] - query_phi[b, q]
+        phi_diff = key_phi.unsqueeze(-1) - query_phi.unsqueeze(-2)  # (B, K, Q)
+        phi_diff = (phi_diff + torch.pi) % (2 * torch.pi) - torch.pi  # wrap to [-π, π]
+
+        # Threshold based on window fraction
+        threshold = window_fraction * torch.pi  # window_fraction of π radians on each side
+
+        mask = torch.abs(phi_diff) <= threshold
+        return mask
+
+    def compute_scaled_transpose(self, mask: torch.Tensor) -> torch.Tensor:
+        """Compute a scaled transpose that accounts for different Q and K dimensions.
+
+        When Q ≠ K, the simple transpose changes the aspect ratio of the diagonal.
+        This method rescales the indices so that the diagonal in K×Q space
+        corresponds to the same relative positions as in Q×K space.
+
+        For each (k, q) position in the output K×Q mask:
+        - Map k to the equivalent query position: i = k * Q / K
+        - Map q to the equivalent key position: j = q * K / Q
+        - Look up mask[round(i), round(j)]
+
+        Args:
+            mask: Attention mask of shape (B, Q, K).
+
+        Returns:
+            Transposed mask of shape (B, K, Q) with scaled indices.
+        """
+        B, Q, K = mask.shape
+        device = mask.device
+
+        # Create index grids for K×Q output
+        k_indices = torch.arange(K, device=device, dtype=torch.float32)
+        q_indices = torch.arange(Q, device=device, dtype=torch.float32)
+
+        # Map k to equivalent query index: i = k * Q / K
+        # Map q to equivalent key index: j = q * K / Q
+        i_from_k = (k_indices * Q / K).round().long().clamp(0, Q - 1)  # (K,)
+        j_from_q = (q_indices * K / Q).round().long().clamp(0, K - 1)  # (Q,)
+
+        # Build index tensors for gathering
+        # transposed[b, k, q] = mask[b, i_from_k[k], j_from_q[q]]
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, K, Q)
+        i_idx = i_from_k.view(1, K, 1).expand(B, K, Q)
+        j_idx = j_from_q.view(1, 1, Q).expand(B, K, Q)
+
+        transposed_mask = mask[batch_idx, i_idx, j_idx]
+        return transposed_mask
+
+    def compute_bidirectional_mask(
+        self,
+        mask: torch.Tensor,
+        query_phi: torch.Tensor | None,
+        key_phi: torch.Tensor | None,
+        mode: str = "simple",
+    ) -> torch.Tensor:
+        """Compute the attention mask for bidirectional CA based on the specified mode.
+
+        Args:
+            mask: Original attention mask of shape (B, Q, K).
+            query_phi: Query phi values of shape (B, Q), required for some modes.
+            key_phi: Key phi values of shape (B, K), required for some modes.
+            mode: Transpose mode - "simple", "phi_aware", "direct_phi", or "scaled".
+
+        Returns:
+            Transposed/transformed mask of shape (B, K, Q) for bidirectional CA.
+        """
+        if mode == "simple":
+            return mask.transpose(-2, -1)
+
+        elif mode == "scaled":
+            return self.compute_scaled_transpose(mask)
+
+        elif mode == "phi_aware":
+            if query_phi is None or key_phi is None:
+                raise ValueError("phi_aware mode requires query_phi and key_phi")
+            return self.compute_phi_aware_transpose_vectorized(mask, query_phi, key_phi)
+
+        elif mode == "direct_phi":
+            if query_phi is None or key_phi is None:
+                raise ValueError("direct_phi mode requires query_phi and key_phi")
+            # Use window size to determine the phi threshold
+            Q, K = mask.shape[-2], mask.shape[-1]
+            # Window fraction based on relative size: want similar coverage as the original mask
+            window_fraction = 0.5 / max(Q, K) * self.window_size if self.window_size > 0 else 0.1
+            window_fraction = min(window_fraction, 0.5)  # Cap at 90 degrees
+            return self.compute_direct_phi_mask(query_phi, key_phi, window_fraction)
+
+        else:
+            raise ValueError(f"Unknown bidirectional_ca_transpose_mode: {mode}")
 
 
 class MaskFormerDecoderLayer(nn.Module):
