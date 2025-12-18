@@ -75,6 +75,9 @@ class MaskFormerDecoder(nn.Module):
         bidirectional_ca_start_layer: int | None = None,
         bidirectional_ca_use_key_values: bool = False,
         bidirectional_ca_transpose_mode: str = "simple",
+        bidirectional_ca_window_scale: float = 1.0,
+        bidirectional_ca_soft_narrowing: bool = False,
+        bidirectional_ca_narrowing_tau: float = 0.1,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -188,8 +191,16 @@ class MaskFormerDecoder(nn.Module):
             mask_layer_limit = 1
         elif self.mask_attention_num_layers is not None:
             mask_layer_limit = self.mask_attention_num_layers
+        
+        # Check if mask attention and local strided attention are disjoint (don't overlap in layers)
+        # Case 1: mask attention is confined to early layers, LCA starts after
+        ma_before_lca = mask_layer_limit is not None and self.local_strided_start_layer >= mask_layer_limit
+        # Case 2: LCA is confined to early layers, mask attention starts after
+        lca_end_layer = 1 if self.local_strided_first_layer_only else float('inf')
+        lca_before_ma = self.mask_attention_start_layer >= lca_end_layer
+        
         allow_disjoint_masks = (
-            self.mask_attention and self.local_strided_attn and mask_layer_limit is not None and self.local_strided_start_layer >= mask_layer_limit
+            self.mask_attention and self.local_strided_attn and (ma_before_lca or lca_before_ma)
         )
         if combine_ma_lca is None:
             assert not (self.local_strided_attn and self.mask_attention) or allow_disjoint_masks, (
@@ -236,6 +247,21 @@ class MaskFormerDecoder(nn.Module):
         # For backwards compatibility, phi_aware_transpose=True overrides to "phi_aware" mode
         if self.phi_aware_transpose:
             self.bidirectional_ca_transpose_mode = "phi_aware"
+
+        # Window scale for bidirectional CA mask (relative to forward CA)
+        # Values < 1.0 create a narrower window for bidirectional attention
+        # This can reduce "contamination" from neighboring queries when updating keys
+        self.bidirectional_ca_window_scale = float(bidirectional_ca_window_scale)
+        if self.bidirectional_ca_window_scale <= 0:
+            raise ValueError("bidirectional_ca_window_scale must be positive")
+
+        # Soft narrowing: instead of hard mask cutoff, use attention bias
+        # This downweights distant queries without completely blocking them
+        # Preserves gradients and allows the model to still attend to "true" owner even if distant
+        self.bidirectional_ca_soft_narrowing = bidirectional_ca_soft_narrowing
+        self.bidirectional_ca_narrowing_tau = float(bidirectional_ca_narrowing_tau)
+        if self.bidirectional_ca_narrowing_tau <= 0:
+            raise ValueError("bidirectional_ca_narrowing_tau must be positive")
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -504,6 +530,44 @@ class MaskFormerDecoder(nn.Module):
                     mode=self.bidirectional_ca_transpose_mode,
                 )
                 # Update logging mask for the bidirectional direction
+                if decoder_layer.bidirectional_ca:
+                    kv_attn_mask_for_logging = layer_attn_mask_transpose.detach().clone()
+
+            # Apply window narrowing for bidirectional CA
+            # Option 1: Hard narrowing (scale < 1.0, soft_narrowing=False)
+            # Option 2: Soft narrowing via attention bias (soft_narrowing=True)
+            if (
+                self.bidirectional_ca_soft_narrowing
+                and layer_attn_mask_transpose is not None
+                and torch.is_tensor(layer_attn_mask_transpose)
+            ):
+                # Soft narrowing: compute attention bias that downweights distant queries
+                # This preserves gradients and allows attending to "true" owner even if distant
+                soft_bias = self.compute_soft_narrowing_bias(
+                    layer_attn_mask_transpose,
+                    self.bidirectional_ca_narrowing_tau,
+                    query_phi=x.get("query_phi"),
+                    key_phi=x.get("key_phi"),
+                )
+                # Add to existing transpose bias or create new
+                if layer_attn_bias_transpose is not None:
+                    layer_attn_bias_transpose = layer_attn_bias_transpose + soft_bias
+                else:
+                    layer_attn_bias_transpose = soft_bias
+
+            elif (
+                self.bidirectional_ca_window_scale < 1.0
+                and layer_attn_mask_transpose is not None
+                and torch.is_tensor(layer_attn_mask_transpose)
+            ):
+                # Hard narrowing: completely cut off distant queries
+                layer_attn_mask_transpose = self.narrow_bidirectional_mask(
+                    layer_attn_mask_transpose,
+                    self.bidirectional_ca_window_scale,
+                    query_phi=x.get("query_phi"),
+                    key_phi=x.get("key_phi"),
+                )
+                # Update logging mask with the narrowed version
                 if decoder_layer.bidirectional_ca:
                     kv_attn_mask_for_logging = layer_attn_mask_transpose.detach().clone()
 
@@ -1001,6 +1065,174 @@ class MaskFormerDecoder(nn.Module):
 
         else:
             raise ValueError(f"Unknown bidirectional_ca_transpose_mode: {mode}")
+
+    def narrow_bidirectional_mask(
+        self,
+        mask: torch.Tensor,
+        scale: float,
+        query_phi: torch.Tensor | None = None,
+        key_phi: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Narrow the bidirectional CA mask to reduce contamination from neighboring queries.
+
+        Given a K×Q mask for bidirectional CA, this method narrows the attention window
+        so that each key attends to fewer queries. The narrowing is done by keeping only
+        the entries closest to the "center" of each key's attention pattern.
+
+        Args:
+            mask: Bidirectional attention mask of shape (B, K, Q).
+            scale: Scale factor (0 < scale <= 1). E.g., scale=0.5 halves the window width.
+            query_phi: Query phi values of shape (B, Q), used for φ-aware narrowing.
+            key_phi: Key phi values of shape (B, K), used for φ-aware narrowing.
+
+        Returns:
+            Narrowed mask of shape (B, K, Q).
+        """
+        if scale >= 1.0:
+            return mask
+
+        B, K, Q = mask.shape
+        device = mask.device
+
+        if query_phi is not None and key_phi is not None:
+            # φ-aware narrowing: keep entries where |φ_k - φ_q| is smallest
+            # Compute wrapped phi difference
+            phi_diff = key_phi.unsqueeze(-1) - query_phi.unsqueeze(-2)  # (B, K, Q)
+            phi_diff = (phi_diff + torch.pi) % (2 * torch.pi) - torch.pi  # wrap to [-π, π]
+            phi_dist = torch.abs(phi_diff)
+
+            # For each key, find the threshold distance that keeps scale fraction of entries
+            # We use the mask to only consider currently allowed positions
+            mask_bool = mask.bool()
+
+            # Set distance to large value where mask is False
+            large_value = torch.tensor(float('inf'), device=device)
+            masked_dist = torch.where(mask_bool, phi_dist, large_value)
+
+            # For each key (row), find the scale-th percentile distance among allowed queries
+            # This determines the threshold for keeping entries
+            narrowed_mask = torch.zeros_like(mask)
+
+            for b in range(B):
+                for k in range(K):
+                    row_mask = mask_bool[b, k]
+                    if not row_mask.any():
+                        continue
+
+                    row_dist = phi_dist[b, k]
+                    allowed_dist = row_dist[row_mask]
+
+                    # Keep only the closest (scale * count) entries
+                    num_to_keep = max(1, int(allowed_dist.numel() * scale))
+                    if num_to_keep >= allowed_dist.numel():
+                        narrowed_mask[b, k] = mask[b, k]
+                    else:
+                        threshold = torch.kthvalue(allowed_dist, num_to_keep).values
+                        keep = (row_dist <= threshold) & row_mask
+                        narrowed_mask[b, k] = keep.to(mask.dtype)
+
+            return narrowed_mask
+
+        else:
+            # Index-based narrowing: keep entries near the diagonal center
+            # For each key k, the expected query position is q* = k * Q / K
+            k_indices = torch.arange(K, device=device, dtype=torch.float32)
+            q_indices = torch.arange(Q, device=device, dtype=torch.float32)
+
+            # Expected query position for each key
+            expected_q = k_indices * Q / K  # (K,)
+
+            # Distance from expected position
+            dist_from_center = torch.abs(q_indices.unsqueeze(0) - expected_q.unsqueeze(1))  # (K, Q)
+
+            # For wrapped case, also consider wrap-around distance
+            if self.window_wrap:
+                wrap_dist = Q - dist_from_center
+                dist_from_center = torch.minimum(dist_from_center, wrap_dist)
+
+            # Original window width (estimate from mask)
+            mask_bool = mask.bool()
+            avg_width = mask_bool.float().sum(dim=-1).mean()  # average queries per key
+
+            # New threshold
+            new_half_width = (avg_width * scale) / 2
+
+            # Keep entries within new half-width of center
+            within_window = dist_from_center <= new_half_width
+            within_window = within_window.unsqueeze(0).expand(B, -1, -1)
+
+            narrowed_mask = mask_bool & within_window
+            return narrowed_mask.to(mask.dtype)
+
+    def compute_soft_narrowing_bias(
+        self,
+        mask: torch.Tensor,
+        tau: float,
+        query_phi: torch.Tensor | None = None,
+        key_phi: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute a soft attention bias that downweights distant queries without blocking them.
+
+        Instead of a hard mask cutoff, this creates a log-space bias where distant queries
+        get lower attention weight. This preserves gradients and allows the model to still
+        attend to the "true" owning query even if it's outside the typical window.
+
+        The bias is computed as: bias = -|φ_k - φ_q| / tau
+        This means:
+        - Queries at the same φ as the key get bias = 0 (no penalty)
+        - Queries at distance d get bias = -d/tau (penalty proportional to distance)
+        - After softmax, attention weights decay exponentially with distance
+
+        Args:
+            mask: Bidirectional attention mask of shape (B, K, Q).
+            tau: Temperature parameter controlling decay rate. Smaller tau = sharper decay.
+            query_phi: Query phi values of shape (B, Q).
+            key_phi: Key phi values of shape (B, K).
+
+        Returns:
+            Attention bias of shape (B, K, Q) to be added to attention logits.
+        """
+        B, K, Q = mask.shape
+        device = mask.device
+        dtype = query_phi.dtype if query_phi is not None else torch.float32
+
+        if query_phi is not None and key_phi is not None:
+            # φ-aware soft narrowing
+            phi_diff = key_phi.unsqueeze(-1) - query_phi.unsqueeze(-2)  # (B, K, Q)
+            phi_diff = (phi_diff + torch.pi) % (2 * torch.pi) - torch.pi  # wrap to [-π, π]
+            phi_dist = torch.abs(phi_diff)  # (B, K, Q)
+
+            # Normalize distance by π so tau has consistent meaning
+            normalized_dist = phi_dist / torch.pi
+
+            # Compute bias: closer queries get smaller penalty
+            bias = -normalized_dist / tau
+
+        else:
+            # Index-based soft narrowing
+            k_indices = torch.arange(K, device=device, dtype=dtype)
+            q_indices = torch.arange(Q, device=device, dtype=dtype)
+
+            # Expected query position for each key
+            expected_q = k_indices * Q / K  # (K,)
+
+            # Distance from expected position, normalized by Q
+            dist = torch.abs(q_indices.unsqueeze(0) - expected_q.unsqueeze(1)) / Q  # (K, Q)
+
+            # For wrapped case
+            if self.window_wrap:
+                wrap_dist = 1.0 - dist
+                dist = torch.minimum(dist, wrap_dist)
+
+            # Compute bias
+            bias = -dist / tau
+            bias = bias.unsqueeze(0).expand(B, -1, -1)
+
+        # Apply mask: set bias to -inf where mask is False (completely block those positions)
+        mask_bool = mask.bool()
+        bias = torch.where(mask_bool, bias, torch.tensor(float('-inf'), device=device, dtype=dtype))
+
+        return bias
 
 
 class MaskFormerDecoderLayer(nn.Module):
