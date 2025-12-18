@@ -43,9 +43,11 @@ class MaskFormerDecoder(nn.Module):
         use_first_layer_mask_only: bool = False,
         mask_attention_first_layer_only: bool = False,
         mask_attention_num_layers: int | None = None,
+        mask_attention_start_layer: int | None = None,
         every_other_layer: bool = False,
         local_strided_skip_first_layer: bool = False,
         local_strided_start_layer: int | None = None,
+        local_strided_first_layer_only: bool = False,
         local_strided_first_layer_window_size: int | None = None,
         local_strided_first_layer_decay_tau: float | None = None,
         local_strided_decay: bool = False,
@@ -118,9 +120,12 @@ class MaskFormerDecoder(nn.Module):
         self.mask_attention_num_layers = int(mask_attention_num_layers) if mask_attention_num_layers is not None else None
         if self.mask_attention_num_layers is not None:
             assert self.mask_attention_num_layers > 0, "mask_attention_num_layers must be positive"
+        self.mask_attention_start_layer = int(mask_attention_start_layer) if mask_attention_start_layer is not None else 0
+        assert self.mask_attention_start_layer >= 0, "mask_attention_start_layer must be non-negative"
         self.no_if_none_then_all = no_if_none_then_all
         self.every_other_layer = every_other_layer
         self.local_strided_skip_first_layer = local_strided_skip_first_layer
+        self.local_strided_first_layer_only = local_strided_first_layer_only
         if local_strided_start_layer is not None:
             self.local_strided_start_layer = int(local_strided_start_layer)
         else:
@@ -311,8 +316,12 @@ class MaskFormerDecoder(nn.Module):
             elif self.mask_attention_num_layers is not None:
                 layer_uses_mask_attention = layer_index < self.mask_attention_num_layers
             else:
-                layer_uses_mask_attention = True
-            layer_uses_local_strided = self.local_strided_attn and (layer_index >= self.local_strided_start_layer)
+                layer_uses_mask_attention = layer_index >= self.mask_attention_start_layer
+            
+            if self.local_strided_first_layer_only:
+                layer_uses_local_strided = self.local_strided_attn and (layer_index == 0)
+            else:
+                layer_uses_local_strided = self.local_strided_attn and (layer_index >= self.local_strided_start_layer)
             layer_uses_phi_distance_mask = self.use_phi_distance_mask
 
             # if maskattention, PE should be added before generating the mask
