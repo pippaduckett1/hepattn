@@ -174,8 +174,6 @@ class MaskFormerDecoder(nn.Module):
         shift_count = sum(x is not None for x in [self.lca_shift_absolute, self.lca_shift_fractional, self.lca_shift_queries])
         if shift_count > 1:
             raise ValueError("Only one of lca_shift_absolute, lca_shift_fractional, or lca_shift_queries can be set")
-        if shift_count > 0 and self.flipped:
-            raise ValueError("LCA shift is not supported when flipped=True")
 
         if learn_phi_shift:
             # learned scalar in radians fraction (same semantics as before: subtracted inside 2*pi*(.. - phi_shift))
@@ -717,7 +715,7 @@ class MaskFormerDecoder(nn.Module):
 
         idx = torch.arange(num_queries, device=device, dtype=dtype)
         query_fraction = idx / max(num_queries, 1)
-        phi_shift = torch.tensor(self.phi_shift, device=device, dtype=dtype)
+        phi_shift = self.phi_shift.to(device=device, dtype=dtype)
         default_query_phi = 2 * torch.pi * (query_fraction - phi_shift - 0.5)
 
         if self.phi_shift_from_key_phi:

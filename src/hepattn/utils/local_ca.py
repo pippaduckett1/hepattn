@@ -55,10 +55,30 @@ def get_local_ca_mask(
 
 
 def get_local_ca_mask_flipped(
-    n_objects, n_inputs, window_size, stride=1, device=None, wrap=False
+    n_objects,
+    n_inputs,
+    window_size,
+    stride=1,
+    device=None,
+    wrap=False,
+    shift_absolute: int | None = None,
+    shift_fractional: float | None = None,
+    shift_queries: int | None = None,
 ):
     assert window_size >= 0, "Window size must be non-negative"
     assert window_size % 2 == 0, "Window size must be even"
+    shift_count = sum(x is not None for x in [shift_absolute, shift_fractional, shift_queries])
+    assert shift_count <= 1, "Only one of shift_absolute, shift_fractional, or shift_queries can be set"
+
+    # Compute the shift in key positions
+    shift = 0
+    if shift_absolute is not None:
+        shift = shift_absolute
+    elif shift_fractional is not None:
+        shift = round(shift_fractional * n_inputs)
+    elif shift_queries is not None:
+        # Convert query positions to key positions by multiplying by stride
+        shift = round(shift_queries * stride)
 
     mask = torch.zeros((n_objects, n_inputs), dtype=torch.bool, device=device)
 
@@ -67,11 +87,16 @@ def get_local_ca_mask_flipped(
         # reverse the order of rows to flip diagonal direction
         rev_i = n_objects - 1 - i
 
-        start_raw = round(rev_i * stride) - window_size // 2
-        end_raw   = round(rev_i * stride) + window_size // 2 + 1
+        # Apply shift to the center position
+        center = round(rev_i * stride) + shift
+        if wrap:
+            center = center % n_inputs
+
+        start_raw = center - window_size // 2
+        end_raw = center + window_size // 2 + 1
 
         start = max(0, start_raw)
-        end   = min(n_inputs, end_raw)
+        end = min(n_inputs, end_raw)
         mask[i, start:end] = 1
 
         if wrap:
@@ -155,11 +180,6 @@ def auto_local_ca_mask(
     device = q.device
     use_phi = query_phi is not None and key_phi is not None
     stride = n_inputs / n_objects
-
-    # Validate shift parameters
-    shift_count = sum(x is not None for x in [shift_absolute, shift_fractional, shift_queries])
-    if shift_count > 0 and flipped:
-        raise ValueError("LCA shift is not supported when flipped=True")
 
     if use_phi:
         batch_size = q.shape[0]
