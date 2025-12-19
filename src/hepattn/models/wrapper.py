@@ -89,6 +89,10 @@ class ModelWrapper(LightningModule):
     def training_step(self, batch: tuple[dict[str, Tensor], dict[str, Tensor]], batch_idx: int) -> dict[str, Tensor] | None:
         inputs, targets = batch
 
+        # Inject num_truth_particles for dynamic query experiments
+        if hasattr(self.model, "decoder") and getattr(self.model.decoder, "dynamic_queries", False):
+            inputs["num_truth_particles"] = targets[f"{self.model.target_object}_valid"].sum()
+
         # Get the model outputs
         outputs = self.model(inputs)
 
@@ -112,6 +116,10 @@ class ModelWrapper(LightningModule):
     def validation_step(self, batch: tuple[dict[str, Tensor], dict[str, Tensor]]) -> dict[str, Tensor]:
         inputs, targets = batch
 
+        # Inject num_truth_particles for dynamic query experiments
+        if hasattr(self.model, "decoder") and getattr(self.model.decoder, "dynamic_queries", False):
+            inputs["num_truth_particles"] = targets[f"{self.model.target_object}_valid"].sum()
+
         # Get the raw model outputs
         outputs = self.model(inputs)
 
@@ -127,6 +135,11 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch: tuple[dict[str, Tensor], dict[str, Tensor]]) -> tuple[dict[str, Tensor], dict[str, Tensor], dict[str, Tensor]]:
         inputs, targets = batch
+
+        # Inject num_truth_particles for dynamic query experiments
+        if hasattr(self.model, "decoder") and getattr(self.model.decoder, "dynamic_queries", False):
+            inputs["num_truth_particles"] = targets[f"{self.model.target_object}_valid"].sum()
+
         outputs = self.model(inputs)
 
         # Calculate loss to also run matching

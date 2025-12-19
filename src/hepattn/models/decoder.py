@@ -78,11 +78,12 @@ class MaskFormerDecoder(nn.Module):
         bidirectional_ca_window_scale: float = 1.0,
         bidirectional_ca_soft_narrowing: bool = False,
         bidirectional_ca_narrowing_tau: float = 0.1,
+        dynamic_queries: bool = False,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
         Args:
-            num_queries: The number of object-level queries.
+            num_queries: The number of object-level queries (ignored when dynamic_queries=True).
             decoder_layer_config: Configuration dictionary used to initialize each MaskFormerDecoderLayer.
             num_decoder_layers: The number of decoder layers to stack.
             mask_attention: If True, attention masks will be used to control which input constituents are attended to.
@@ -113,7 +114,11 @@ class MaskFormerDecoder(nn.Module):
         self.window_size = window_size
         self.window_wrap = window_wrap
         self.unified_decoding = unified_decoding
-        self.initial_queries = nn.Parameter(torch.randn(self.num_queries, decoder_layer_config["dim"]))
+        self.dynamic_queries = dynamic_queries
+        # When dynamic_queries=True, queries are zero-initialized at forward time based on truth particle count
+        # When dynamic_queries=False, queries are learnable parameters
+        if not self.dynamic_queries:
+            self.initial_queries = nn.Parameter(torch.randn(self.num_queries, decoder_layer_config["dim"]))
         self.fast_local_ca = fast_local_ca
         self.block_size = block_size
         self.phi_shift = phi_shift
@@ -280,8 +285,17 @@ class MaskFormerDecoder(nn.Module):
         num_constituents = x["key_embed"].shape[-2]
 
         # Generate the queries that represent objects
-        x["query_embed"] = self.initial_queries.expand(batch_size, -1, -1)
-        x["query_valid"] = torch.full((batch_size, self.num_queries), True, device=x["query_embed"].device)
+        if self.dynamic_queries:
+            # Dynamic queries: num_queries comes from input, zero-initialized
+            if "num_truth_particles" not in x["inputs"]:
+                raise ValueError("dynamic_queries=True requires 'num_truth_particles' in inputs")
+            num_queries = int(x["inputs"]["num_truth_particles"].item())
+            x["query_embed"] = torch.zeros(batch_size, num_queries, self.dim, device=x["key_embed"].device, dtype=x["key_embed"].dtype)
+            x["query_valid"] = torch.full((batch_size, num_queries), True, device=x["key_embed"].device)
+        else:
+            # Standard learnable queries
+            x["query_embed"] = self.initial_queries.expand(batch_size, -1, -1)
+            x["query_valid"] = torch.full((batch_size, self.num_queries), True, device=x["query_embed"].device)
 
         if self.posenc:
             x["query_posenc"], x["key_posenc"] = self.generate_positional_encodings(x)
@@ -423,7 +437,8 @@ class MaskFormerDecoder(nn.Module):
                     if task_attn_mask.dim() == 2:
                         task_attn_mask = task_attn_mask.unsqueeze(-1).expand(-1, -1, num_constituents)
                 else:
-                    task_attn_mask = torch.full((batch_size, self.num_queries, num_constituents), False, device=x["key_embed"].device)
+                    num_queries_actual = x["query_embed"].shape[1]
+                    task_attn_mask = torch.full((batch_size, num_queries_actual, num_constituents), False, device=x["key_embed"].device)
                     for input_name, mask in attn_masks.items():
                         task_mask = mask.flatten()
                         task_attn_mask[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_mask)] = task_mask
@@ -698,9 +713,10 @@ class MaskFormerDecoder(nn.Module):
         device = x["query_embed"].device
         dtype = x["query_embed"].dtype
         batch_size = x["query_embed"].shape[0]
+        num_queries = x["query_embed"].shape[1]  # Use actual query count (supports dynamic queries)
 
-        idx = torch.arange(self.num_queries, device=device, dtype=dtype)
-        query_fraction = idx / max(self.num_queries, 1)
+        idx = torch.arange(num_queries, device=device, dtype=dtype)
+        query_fraction = idx / max(num_queries, 1)
         phi_shift = torch.tensor(self.phi_shift, device=device, dtype=dtype)
         default_query_phi = 2 * torch.pi * (query_fraction - phi_shift - 0.5)
 
@@ -708,7 +724,7 @@ class MaskFormerDecoder(nn.Module):
             if "key_phi" not in x:
                 raise ValueError("key_phi is required when phi_shift_from_key_phi is True")
             min_key_phi = torch.amin(x["key_phi"], dim=-1, keepdim=True)
-            denom = max(self.num_queries - 1, 1)
+            denom = max(num_queries - 1, 1)
             span_fraction = idx / denom
             x["query_phi"] = min_key_phi + 2 * torch.pi * span_fraction
         elif self.quantile_query_phi:
@@ -746,8 +762,9 @@ class MaskFormerDecoder(nn.Module):
 
     def _compute_quantile_query_phi(self, x: dict, default_query_phi: Tensor, device, dtype) -> Tensor:
         valid_key_phi = self._collect_valid_key_phi(x)
-        query_phi = torch.empty((len(valid_key_phi), self.num_queries), device=device, dtype=dtype)
-        fractions = torch.linspace(0.0, 1.0, steps=self.num_queries, device=device, dtype=dtype)
+        num_queries = x["query_embed"].shape[1]  # Use actual query count (supports dynamic queries)
+        query_phi = torch.empty((len(valid_key_phi), num_queries), device=device, dtype=dtype)
+        fractions = torch.linspace(0.0, 1.0, steps=num_queries, device=device, dtype=dtype)
 
         for batch_idx, hits in enumerate(valid_key_phi):
             if hits.numel() == 0:
@@ -769,11 +786,12 @@ class MaskFormerDecoder(nn.Module):
 
     def _compute_histogram_query_phi(self, x: dict, default_query_phi: Tensor, device, dtype) -> Tensor:
         valid_key_phi = self._collect_valid_key_phi(x)
-        query_phi = torch.empty((len(valid_key_phi), self.num_queries), device=device, dtype=dtype)
+        num_queries = x["query_embed"].shape[1]  # Use actual query count (supports dynamic queries)
+        query_phi = torch.empty((len(valid_key_phi), num_queries), device=device, dtype=dtype)
         hist_dtype = torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
         bin_edges = torch.linspace(-torch.pi, torch.pi, self.histogram_query_phi_bins + 1, device=device, dtype=hist_dtype)
         bin_centers = (0.5 * (bin_edges[:-1] + bin_edges[1:])).to(dtype)
-        fractions = torch.linspace(0.0, 1.0, steps=self.num_queries, device=device, dtype=hist_dtype)
+        fractions = torch.linspace(0.0, 1.0, steps=num_queries, device=device, dtype=hist_dtype)
 
         bucket_boundaries = bin_edges[1:-1]
         for batch_idx, hits in enumerate(valid_key_phi):
