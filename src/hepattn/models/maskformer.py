@@ -213,13 +213,37 @@ class MaskFormer(nn.Module):
 
             costs[layer_name] = layer_costs
 
+        # Check if we're using dynamic queries (num_queries = num_truth_particles)
+        # In this case, matching is trivial - just use identity mapping
+        use_dynamic_queries = getattr(self.decoder, "dynamic_queries", False)
+
+        # With dynamic queries, slice targets to only valid particles (no padding)
+        # Only slice target object tensors, not constituent/hit tensors
+        if use_dynamic_queries:
+            num_valid = targets[f"{self.target_object}_valid"].sum().int().item()
+            target_prefix = f"{self.target_object}_"
+            sliced_targets = {}
+            for k, v in targets.items():
+                if k.startswith(target_prefix) and v.dim() >= 2 and v.shape[1] > num_valid:
+                    # Slice object-level targets (particle_valid, particle_hit_valid, particle_pt, etc.)
+                    sliced_targets[k] = v[:, :num_valid]
+                else:
+                    sliced_targets[k] = v
+            targets = sliced_targets
+
         # Permute the outputs for each output in each layer
         for layer_name, cost in costs.items():
             if cost is None:
                 continue
 
-            # Get the indicies that can permute the predictions to yield their optimal matching
-            pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
+            if use_dynamic_queries:
+                # With dynamic queries, num_queries = num_truth_particles
+                # Use identity matching - predictions already correspond 1:1 with truth
+                num_queries = cost.shape[1]
+                pred_idxs = torch.arange(num_queries, device=cost.device).unsqueeze(0).expand(cost.shape[0], -1)
+            else:
+                # Get the indicies that can permute the predictions to yield their optimal matching
+                pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
 
             for task in self.tasks:
                 # Tasks without a object dimension do not need permutation (constituent-level or sample-level)
