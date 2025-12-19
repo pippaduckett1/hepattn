@@ -147,7 +147,7 @@ class AttnMaskLogger(Callback):
             ax.set_ylabel("Count")
         else:
             ax.hist(
-                invalid_phi.numpy(),
+                invalid_phi.float().numpy(),
                 bins=self.invalid_query_phi_bins,
                 color="#1f77b4",
                 edgecolor="black",
@@ -179,20 +179,20 @@ class AttnMaskLogger(Callback):
 
         fig, ax = plt.subplots(constrained_layout=True, dpi=300)
         if valid_queries.numel() > 0:
-            ax.hist(valid_queries.numpy(), bins=64, alpha=0.5, label="Valid queries")
+            ax.hist(valid_queries.float().numpy(), bins=64, alpha=0.5, label="Valid queries")
 
         if invalid_queries.numel() > 0:
-            ax.hist(invalid_queries.numpy(), bins=64, alpha=0.5, label="Invalid queries", color="#ff7f0e")
+            ax.hist(invalid_queries.float().numpy(), bins=64, alpha=0.5, label="Invalid queries", color="#ff7f0e")
 
         if hit_phi is not None and hit_valid is not None:
-            hp = hit_phi[0].detach().cpu()
+            hp = hit_phi[0].detach().cpu().float()
             hv = hit_valid[0].detach().cpu().bool()
             hp = hp[hv].numpy()
             if hp.size > 0:
                 ax.hist(hp, bins=64, alpha=0.4, label="Hits")
 
         if particle_phi is not None and particle_valid is not None:
-            pp = particle_phi[0].detach().cpu()
+            pp = particle_phi[0].detach().cpu().float()
             pv = particle_valid[0].detach().cpu().bool()
             pp = pp[pv].numpy()
             if pp.size > 0:
@@ -227,7 +227,7 @@ class AttnMaskLogger(Callback):
             invalid_phi = query_phi[invalid_mask]
             if valid_phi.numel() > 0:
                 ax.hist(
-                    valid_phi.numpy(),
+                    valid_phi.float().numpy(),
                     bins=bins,
                     alpha=0.5,
                     label="Pred valid",
@@ -236,7 +236,7 @@ class AttnMaskLogger(Callback):
                 )
             if invalid_phi.numel() > 0:
                 ax.hist(
-                    invalid_phi.numpy(),
+                    invalid_phi.float().numpy(),
                     bins=bins,
                     alpha=0.5,
                     label="Pred invalid",
@@ -247,7 +247,7 @@ class AttnMaskLogger(Callback):
                 hit_phi = diagnostics.get("hit_phi")
                 hit_valid = diagnostics.get("hit_valid")
                 if hit_phi is not None and hit_valid is not None:
-                    hp = hit_phi[0].detach().cpu()
+                    hp = hit_phi[0].detach().cpu().float()
                     hv = hit_valid[0].detach().cpu().bool()
                     hp = hp[hv]
                     if hp.numel() > 0:
