@@ -78,6 +78,7 @@ class MaskFormerDecoder(nn.Module):
         bidirectional_ca_window_scale: float = 1.0,
         bidirectional_ca_soft_narrowing: bool = False,
         bidirectional_ca_narrowing_tau: float = 0.1,
+        bidirectional_ca_local_window_scale: float = 0.25,
         dynamic_queries: bool = False,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
@@ -243,7 +244,8 @@ class MaskFormerDecoder(nn.Module):
         # - "phi_aware": remap based on φ positions (uses phi_aware_transpose)
         # - "direct_phi": compute K×Q mask directly from φ similarity, ignoring task mask
         # - "scaled": scale indices to account for Q≠K aspect ratio
-        valid_transpose_modes = {"simple", "phi_aware", "direct_phi", "scaled"}
+        # - "local": build fresh K×Q local window mask based on index positions (ignores task mask)
+        valid_transpose_modes = {"simple", "phi_aware", "direct_phi", "scaled", "local"}
         if bidirectional_ca_transpose_mode not in valid_transpose_modes:
             raise ValueError(f"bidirectional_ca_transpose_mode must be one of {valid_transpose_modes}")
         self.bidirectional_ca_transpose_mode = bidirectional_ca_transpose_mode
@@ -265,6 +267,12 @@ class MaskFormerDecoder(nn.Module):
         self.bidirectional_ca_narrowing_tau = float(bidirectional_ca_narrowing_tau)
         if self.bidirectional_ca_narrowing_tau <= 0:
             raise ValueError("bidirectional_ca_narrowing_tau must be positive")
+
+        # Local window scale for "local" bidirectional CA mode
+        # Fraction of forward window size to use for backward window (default 0.25 = W/4)
+        self.bidirectional_ca_local_window_scale = float(bidirectional_ca_local_window_scale)
+        if self.bidirectional_ca_local_window_scale <= 0:
+            raise ValueError("bidirectional_ca_local_window_scale must be positive")
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -1001,6 +1009,60 @@ class MaskFormerDecoder(nn.Module):
         mask = torch.abs(phi_diff) <= threshold
         return mask
 
+    def compute_local_backward_mask(
+        self,
+        q_len: int,
+        k_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        window_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Compute a K×Q local attention mask for bidirectional CA.
+
+        Instead of transposing the forward mask, this builds a fresh mask where each key
+        attends to queries in a local window around its corresponding position. The window
+        size is derived from the forward window size scaled by window_scale.
+
+        This is useful when K >> Q (e.g., K ~ 5Q) where simple transpose creates very
+        sparse attention in the query dimension.
+
+        Args:
+            q_len: Number of queries.
+            k_len: Number of keys.
+            device: Device for the tensor.
+            dtype: Data type for computation.
+            window_scale: Fraction of forward window size to use. If None, uses
+                self.bidirectional_ca_local_window_scale (default 0.25 = W/4).
+
+        Returns:
+            Boolean mask of shape (1, K, Q) where True indicates attention is allowed.
+        """
+        if window_scale is None:
+            window_scale = self.bidirectional_ca_local_window_scale
+
+        # Forward window as fraction of key space
+        forward_window_fraction = self.window_size / k_len
+
+        # Backward window fraction: scale the forward window
+        # This gives the backward window the same "angular" coverage scaled by window_scale
+        backward_window_fraction = forward_window_fraction * window_scale
+
+        # Index fractions for keys and queries
+        k_fractions = torch.arange(k_len, device=device, dtype=dtype) / k_len
+        q_fractions = torch.arange(q_len, device=device, dtype=dtype) / q_len
+
+        # Distance in fraction space: |k/K - q/Q|
+        dist = torch.abs(k_fractions.unsqueeze(-1) - q_fractions.unsqueeze(-2))  # (K, Q)
+
+        # Handle wrapping if enabled (for cyclic φ coordinates)
+        if self.window_wrap:
+            dist = torch.minimum(dist, 1.0 - dist)
+
+        # Create mask: allow attention within half-window on each side
+        mask = dist <= (backward_window_fraction / 2)
+
+        return mask.unsqueeze(0)  # (1, K, Q)
+
     def compute_scaled_transpose(self, mask: torch.Tensor) -> torch.Tensor:
         """Compute a scaled transpose that accounts for different Q and K dimensions.
 
@@ -1053,7 +1115,7 @@ class MaskFormerDecoder(nn.Module):
             mask: Original attention mask of shape (B, Q, K).
             query_phi: Query phi values of shape (B, Q), required for some modes.
             key_phi: Key phi values of shape (B, K), required for some modes.
-            mode: Transpose mode - "simple", "phi_aware", "direct_phi", or "scaled".
+            mode: Transpose mode - "simple", "phi_aware", "direct_phi", "scaled", or "local".
 
         Returns:
             Transposed/transformed mask of shape (B, K, Q) for bidirectional CA.
@@ -1078,6 +1140,20 @@ class MaskFormerDecoder(nn.Module):
             window_fraction = 0.5 / max(Q, K) * self.window_size if self.window_size > 0 else 0.1
             window_fraction = min(window_fraction, 0.5)  # Cap at 90 degrees
             return self.compute_direct_phi_mask(query_phi, key_phi, window_fraction)
+
+        elif mode == "local":
+            # Build a fresh K×Q local window mask instead of transposing
+            # Useful when K >> Q to get balanced coverage in both directions
+            Q, K = mask.shape[-2], mask.shape[-1]
+            local_mask = self.compute_local_backward_mask(
+                q_len=Q,
+                k_len=K,
+                device=mask.device,
+                dtype=torch.float32,
+            )
+            # Expand to batch size
+            B = mask.shape[0]
+            return local_mask.expand(B, -1, -1).to(mask.dtype)
 
         else:
             raise ValueError(f"Unknown bidirectional_ca_transpose_mode: {mode}")
