@@ -80,6 +80,7 @@ class MaskFormerDecoder(nn.Module):
         bidirectional_ca_narrowing_tau: float = 0.1,
         bidirectional_ca_local_window_scale: float = 0.25,
         dynamic_queries: bool = False,
+        log_diagnostic_task_masks: bool = False,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -195,17 +196,15 @@ class MaskFormerDecoder(nn.Module):
             mask_layer_limit = 1
         elif self.mask_attention_num_layers is not None:
             mask_layer_limit = self.mask_attention_num_layers
-        
+
         # Check if mask attention and local strided attention are disjoint (don't overlap in layers)
         # Case 1: mask attention is confined to early layers, LCA starts after
         ma_before_lca = mask_layer_limit is not None and self.local_strided_start_layer >= mask_layer_limit
         # Case 2: LCA is confined to early layers, mask attention starts after
-        lca_end_layer = 1 if self.local_strided_first_layer_only else float('inf')
+        lca_end_layer = 1 if self.local_strided_first_layer_only else float("inf")
         lca_before_ma = self.mask_attention_start_layer >= lca_end_layer
-        
-        allow_disjoint_masks = (
-            self.mask_attention and self.local_strided_attn and (ma_before_lca or lca_before_ma)
-        )
+
+        allow_disjoint_masks = self.mask_attention and self.local_strided_attn and (ma_before_lca or lca_before_ma)
         if combine_ma_lca is None:
             assert not (self.local_strided_attn and self.mask_attention) or allow_disjoint_masks, (
                 "local_strided_attn and mask_attention cannot both be True without combine_ma_lca unless "
@@ -273,6 +272,9 @@ class MaskFormerDecoder(nn.Module):
         self.bidirectional_ca_local_window_scale = float(bidirectional_ca_local_window_scale)
         if self.bidirectional_ca_local_window_scale <= 0:
             raise ValueError("bidirectional_ca_local_window_scale must be positive")
+
+        # Diagnostic mode: log task masks at multiple points within each layer
+        self.log_diagnostic_task_masks = log_diagnostic_task_masks
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -363,7 +365,7 @@ class MaskFormerDecoder(nn.Module):
                 layer_uses_mask_attention = layer_index < self.mask_attention_num_layers
             else:
                 layer_uses_mask_attention = layer_index >= self.mask_attention_start_layer
-            
+
             if self.local_strided_first_layer_only:
                 layer_uses_local_strided = self.local_strided_attn and (layer_index == 0)
             else:
@@ -557,11 +559,7 @@ class MaskFormerDecoder(nn.Module):
             # Apply window narrowing for bidirectional CA
             # Option 1: Hard narrowing (scale < 1.0, soft_narrowing=False)
             # Option 2: Soft narrowing via attention bias (soft_narrowing=True)
-            if (
-                self.bidirectional_ca_soft_narrowing
-                and layer_attn_mask_transpose is not None
-                and torch.is_tensor(layer_attn_mask_transpose)
-            ):
+            if self.bidirectional_ca_soft_narrowing and layer_attn_mask_transpose is not None and torch.is_tensor(layer_attn_mask_transpose):
                 # Soft narrowing: compute attention bias that downweights distant queries
                 # This preserves gradients and allows attending to "true" owner even if distant
                 soft_bias = self.compute_soft_narrowing_bias(
@@ -576,11 +574,7 @@ class MaskFormerDecoder(nn.Module):
                 else:
                     layer_attn_bias_transpose = soft_bias
 
-            elif (
-                self.bidirectional_ca_window_scale < 1.0
-                and layer_attn_mask_transpose is not None
-                and torch.is_tensor(layer_attn_mask_transpose)
-            ):
+            elif self.bidirectional_ca_window_scale < 1.0 and layer_attn_mask_transpose is not None and torch.is_tensor(layer_attn_mask_transpose):
                 # Hard narrowing: completely cut off distant queries
                 layer_attn_mask_transpose = self.narrow_bidirectional_mask(
                     layer_attn_mask_transpose,
@@ -597,20 +591,97 @@ class MaskFormerDecoder(nn.Module):
 
             # Update the keys and queries
             q_mask = x.get("query_mask") if apply_query_masks else None
-            x["query_embed"], x["key_embed"] = decoder_layer(
-                x["query_embed"],
-                x["key_embed"],
-                attn_mask=layer_attn_mask,
-                attn_bias=layer_attn_bias,
-                q_mask=q_mask,
-                kv_mask=x.get("key_valid"),
-                query_posenc=x["query_posenc"] if (self.posenc and self.add_pe_in_attn) else None,
-                key_posenc=x["key_posenc"] if (self.posenc and self.add_pe_in_attn) else None,
-                attn_mask_transpose=layer_attn_mask_transpose,
-                attn_bias_transpose=layer_attn_bias_transpose,
-                use_bidirectional_ca=layer_use_bidirectional,
-                use_key_values=self.bidirectional_ca_use_key_values,
-            )
+            query_posenc = x["query_posenc"] if (self.posenc and self.add_pe_in_attn) else None
+            key_posenc = x["key_posenc"] if (self.posenc and self.add_pe_in_attn) else None
+
+            if self.log_diagnostic_task_masks:
+                # Diagnostic mode: run decoder layer operations step-by-step to log task masks
+                # Step 1: Forward cross-attention (q_ca)
+                q_pe = x["query_embed"] if query_posenc is None else x["query_embed"] + decoder_layer.scale_pe * query_posenc
+                kv_pe = x["key_embed"] if key_posenc is None else x["key_embed"] + decoder_layer.scale_pe * key_posenc
+                q_after_ca = decoder_layer.q_ca(
+                    q_pe, k=kv_pe, v=x["key_embed"], attn_mask=layer_attn_mask, attn_bias=layer_attn_bias, q_mask=q_mask, kv_mask=x.get("key_valid")
+                )
+                q_after_ca = decoder_layer.q_dense(q_after_ca)
+
+                # Log task mask after forward CA
+                x_temp = {**x, "query_embed": q_after_ca}
+                diag_masks = self._compute_diagnostic_task_mask(x_temp, "after_ca")
+                if diag_masks:
+                    for k, v in diag_masks.items():
+                        outputs[f"layer_{layer_index}"][k] = v
+
+                # Step 2: Self-attention (q_sa)
+                q_after_sa = q_after_ca
+                if decoder_layer.enable_query_self_attn:
+                    if decoder_layer.sa_pe:
+                        q_pe_sa = q_after_ca if query_posenc is None else q_after_ca + decoder_layer.scale_pe * query_posenc
+                        q_after_sa = decoder_layer.q_sa(q_pe_sa, k=q_pe_sa, v=q_after_ca, q_mask=q_mask)
+                    else:
+                        q_after_sa = decoder_layer.q_sa(q_after_ca, k=q_after_ca, v=q_after_ca, q_mask=q_mask)
+
+                # Log task mask after self-attention
+                x_temp = {**x, "query_embed": q_after_sa}
+                diag_masks = self._compute_diagnostic_task_mask(x_temp, "after_sa")
+                if diag_masks:
+                    for k, v in diag_masks.items():
+                        outputs[f"layer_{layer_index}"][k] = v
+
+                # Step 3: Bidirectional cross-attention (kv_ca)
+                kv_after_bidi = x["key_embed"]
+                do_bidirectional = layer_use_bidirectional and decoder_layer.bidirectional_ca
+                if do_bidirectional:
+                    bidi_attn_mask = (
+                        layer_attn_mask_transpose
+                        if layer_attn_mask_transpose is not None
+                        else (layer_attn_mask.transpose(-2, -1) if layer_attn_mask is not None else None)
+                    )
+                    bidi_attn_bias = (
+                        layer_attn_bias_transpose
+                        if layer_attn_bias_transpose is not None
+                        else (layer_attn_bias.transpose(-2, -1) if layer_attn_bias is not None else None)
+                    )
+                    q_pe_bidi = q_after_sa if query_posenc is None else q_after_sa + decoder_layer.scale_pe * query_posenc
+                    kv_pe_bidi = x["key_embed"] if key_posenc is None else x["key_embed"] + decoder_layer.scale_pe * key_posenc
+                    v_for_bidi = x["key_embed"] if self.bidirectional_ca_use_key_values else q_after_sa
+                    kv_after_bidi = decoder_layer.kv_ca(
+                        kv_pe_bidi,
+                        k=q_pe_bidi,
+                        v=v_for_bidi,
+                        attn_mask=bidi_attn_mask,
+                        attn_bias=bidi_attn_bias,
+                        q_mask=x.get("key_valid"),
+                        kv_mask=q_mask,
+                    )
+                    kv_after_bidi = decoder_layer.kv_dense(kv_after_bidi)
+
+                # Log task mask after bidirectional CA
+                x_temp = {**x, "query_embed": q_after_sa, "key_embed": kv_after_bidi}
+                diag_masks = self._compute_diagnostic_task_mask(x_temp, "after_bidi")
+                if diag_masks:
+                    for k, v in diag_masks.items():
+                        outputs[f"layer_{layer_index}"][k] = v
+
+                # Update embeddings
+                x["query_embed"] = q_after_sa
+                x["key_embed"] = kv_after_bidi
+                decoder_layer.last_q_sa_delta = (q_after_sa - q_after_ca).norm(dim=-1).detach()
+            else:
+                # Standard mode: call decoder layer as a unit
+                x["query_embed"], x["key_embed"] = decoder_layer(
+                    x["query_embed"],
+                    x["key_embed"],
+                    attn_mask=layer_attn_mask,
+                    attn_bias=layer_attn_bias,
+                    q_mask=q_mask,
+                    kv_mask=x.get("key_valid"),
+                    query_posenc=query_posenc,
+                    key_posenc=key_posenc,
+                    attn_mask_transpose=layer_attn_mask_transpose,
+                    attn_bias_transpose=layer_attn_bias_transpose,
+                    use_bidirectional_ca=layer_use_bidirectional,
+                    use_key_values=self.bidirectional_ca_use_key_values,
+                )
 
             if kv_attn_mask_for_logging is not None:
                 outputs[f"layer_{layer_index}"]["attn_mask_kv"] = kv_attn_mask_for_logging
@@ -622,6 +693,29 @@ class MaskFormerDecoder(nn.Module):
                 x = unmerge_inputs(x, input_names)
 
         return x, outputs
+
+    def _compute_diagnostic_task_mask(self, x: dict[str, Tensor], stage_name: str) -> dict[str, Tensor] | None:
+        """Compute task attention mask for diagnostic logging.
+
+        Args:
+            x: Current state dictionary with embeddings.
+            stage_name: Name of the stage (for logging).
+
+        Returns:
+            Dictionary with task mask tensors, or None if no mask tasks.
+        """
+        if self.tasks is None:
+            return None
+
+        result = {}
+        for task in self.tasks:
+            # Check if task has attn_mask method (ObjectHitMaskTask and similar)
+            if hasattr(task, "attn_mask") and hasattr(task, "mask_attn") and getattr(task, "mask_attn", False):
+                task_outputs = task(x)
+                task_attn_masks = task.attn_mask(task_outputs)
+                for input_name, mask in task_attn_masks.items():
+                    result[f"{stage_name}_{task.name}_{input_name}"] = mask.detach().clone()
+        return result if result else None
 
     def flex_local_ca_mask(
         self,
@@ -1198,7 +1292,7 @@ class MaskFormerDecoder(nn.Module):
             mask_bool = mask.bool()
 
             # Set distance to large value where mask is False
-            large_value = torch.tensor(float('inf'), device=device)
+            large_value = torch.tensor(float("inf"), device=device)
             masked_dist = torch.where(mask_bool, phi_dist, large_value)
 
             # For each key (row), find the scale-th percentile distance among allowed queries
@@ -1322,7 +1416,7 @@ class MaskFormerDecoder(nn.Module):
 
         # Apply mask: set bias to -inf where mask is False (completely block those positions)
         mask_bool = mask.bool()
-        bias = torch.where(mask_bool, bias, torch.tensor(float('-inf'), device=device, dtype=dtype))
+        bias = torch.where(mask_bool, bias, torch.tensor(float("-inf"), device=device, dtype=dtype))
 
         return bias
 

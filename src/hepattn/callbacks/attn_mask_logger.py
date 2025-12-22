@@ -69,17 +69,33 @@ class AttnMaskLogger(Callback):
         fig, ax = plt.subplots(constrained_layout=True, dpi=300)
         cmap = ListedColormap(["#002b7f", "#ffff33"])  # blue for 0, yellow for 1
         im = ax.imshow(mask.numpy().astype(int), aspect="auto", cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
-        # Flip y-axis so lowest phi is at the bottom
-        ax.invert_yaxis()
+
+        # Determine if phi is ascending or descending with index
+        query_phi_ascending = True
+        key_phi_ascending = True
+        if query_phi is not None and query_phi.numel() > 1:
+            query_phi_ascending = query_phi[-1].item() > query_phi[0].item()
+        if key_phi is not None and key_phi.numel() > 1:
+            key_phi_ascending = key_phi[-1].item() > key_phi[0].item()
+
+        # Flip y-axis so lowest phi is at the bottom (only if phi is ascending with index)
+        if query_phi_ascending:
+            ax.invert_yaxis()
+
         # Add colorbar with clear labels
         cbar = plt.colorbar(im, ax=ax, ticks=[0, 1])
         cbar.set_label("Attention Mask", rotation=270, labelpad=15)
         cbar.ax.set_yticklabels(["Masked (0)", "Used in Attention (1)"])
+
         # Add title with step and layer info
         ax.set_title(f"Attention Mask - Step {step}, Layer {layer}")
+
         # Add arrows to axis labels to indicate phi direction
-        ax.set_xlabel("Hits (→ increasing φ)")
-        ax.set_ylabel("Queries (→ increasing φ)")
+        x_arrow = "→" if key_phi_ascending else "←"
+        y_arrow = "↑" if query_phi_ascending else "↓"
+        ax.set_xlabel(f"Hits ({x_arrow} increasing φ)")
+        ax.set_ylabel(f"Queries ({y_arrow} increasing φ)")
+
         if key_phi is not None and key_phi.numel() == mask.shape[1]:
             tick_idx = np.linspace(0, mask.shape[1] - 1, num=min(6, mask.shape[1]), dtype=int)
             ax.set_xticks(tick_idx)
@@ -622,6 +638,25 @@ class AttnMaskLogger(Callback):
                             query_mask=query_mask_sample,
                             invalid_mask=invalid_mask_sample,
                         )
+
+                    # Log diagnostic task masks if present (after_ca, after_sa, after_bidi)
+                    for diag_stage in ["after_ca", "after_sa", "after_bidi"]:
+                        for diag_key in l_out:
+                            if diag_key.startswith(f"{diag_stage}_"):
+                                diag_mask = l_out[diag_key]
+                                if diag_mask is not None and torch.is_tensor(diag_mask):
+                                    diag_im = diag_mask[0].detach().cpu().clone().int()
+                                    self._log_attention_mask(
+                                        pl_module,
+                                        diag_im,
+                                        step,
+                                        layer_index,
+                                        f"diag_{diag_key}_{prefix_suffix}",
+                                        query_phi=query_sample,
+                                        key_phi=key_sample,
+                                        query_mask=query_mask_sample,
+                                        invalid_mask=invalid_mask_sample,
+                                    )
                     if step > 10000:
                         self._log_mask_points_for_kde(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
                     if self.log_stats:
