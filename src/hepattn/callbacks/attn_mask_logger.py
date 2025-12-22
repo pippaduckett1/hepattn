@@ -32,6 +32,12 @@ class AttnMaskLogger(Callback):
         log_all_layers: bool = False,
         log_query_mask_phi_distribution: bool = False,
         log_attn_mask_with_query_overlay: bool = False,
+        # Selective mask logging - set to False to reduce image count
+        log_lca_mask: bool = True,
+        log_task_mask: bool = True,
+        log_kv_mask: bool = True,
+        log_diagnostic_masks: bool = True,
+        log_attn_weights: bool = True,
     ):
         super().__init__()
         self.log_train = log_train
@@ -52,6 +58,11 @@ class AttnMaskLogger(Callback):
         self.log_all_layers = log_all_layers
         self.log_query_mask_phi_distribution = log_query_mask_phi_distribution
         self.log_attn_mask_with_query_overlay = log_attn_mask_with_query_overlay
+        self.log_lca_mask = log_lca_mask
+        self.log_task_mask = log_task_mask
+        self.log_kv_mask = log_kv_mask
+        self.log_diagnostic_masks = log_diagnostic_masks
+        self.log_attn_weights = log_attn_weights
 
     def _log_attention_mask(
         self,
@@ -653,19 +664,20 @@ class AttnMaskLogger(Callback):
                         query_mask=query_mask_sample,
                         invalid_mask=invalid_mask_sample,
                     )
-                    kv_mask = l_out.get("attn_mask_kv")
-                    if kv_mask is not None:
-                        kv_im = kv_mask[0].detach().cpu().clone().int()
-                        self._log_attention_mask(
-                            pl_module,
-                            kv_im,
-                            step,
-                            layer_index,
-                            f"local_ma_mask_kv_{prefix_suffix}",
-                            query_phi=key_sample,
-                            key_phi=query_sample,
-                        )
-                    if lca_mask is not None:
+                    if self.log_kv_mask:
+                        kv_mask = l_out.get("attn_mask_kv")
+                        if kv_mask is not None:
+                            kv_im = kv_mask[0].detach().cpu().clone().int()
+                            self._log_attention_mask(
+                                pl_module,
+                                kv_im,
+                                step,
+                                layer_index,
+                                f"local_ma_mask_kv_{prefix_suffix}",
+                                query_phi=key_sample,
+                                key_phi=query_sample,
+                            )
+                    if self.log_lca_mask and lca_mask is not None:
                         lca_im = lca_mask[0].detach().cpu().clone().int()
                         self._log_attention_mask(
                             pl_module,
@@ -678,7 +690,7 @@ class AttnMaskLogger(Callback):
                             query_mask=query_mask_sample,
                             invalid_mask=invalid_mask_sample,
                         )
-                    if task_mask is not None:
+                    if self.log_task_mask and task_mask is not None:
                         task_im = task_mask[0].detach().cpu().clone().int()
                         self._log_attention_mask(
                             pl_module,
@@ -693,49 +705,51 @@ class AttnMaskLogger(Callback):
                         )
 
                     # Log diagnostic task masks if present (after_ca, after_sa, after_bidi)
-                    for diag_stage in ["after_ca", "after_sa", "after_bidi"]:
-                        for diag_key in l_out:
-                            if diag_key.startswith(f"{diag_stage}_"):
-                                diag_mask = l_out[diag_key]
-                                if diag_mask is not None and torch.is_tensor(diag_mask):
-                                    diag_im = diag_mask[0].detach().cpu().clone().int()
-                                    self._log_attention_mask(
-                                        pl_module,
-                                        diag_im,
-                                        step,
-                                        layer_index,
-                                        f"diag_{diag_key}_{prefix_suffix}",
-                                        query_phi=query_sample,
-                                        key_phi=key_sample,
-                                        query_mask=query_mask_sample,
-                                        invalid_mask=invalid_mask_sample,
-                                    )
+                    if self.log_diagnostic_masks:
+                        for diag_stage in ["after_ca", "after_sa", "after_bidi"]:
+                            for diag_key in l_out:
+                                if diag_key.startswith(f"{diag_stage}_"):
+                                    diag_mask = l_out[diag_key]
+                                    if diag_mask is not None and torch.is_tensor(diag_mask):
+                                        diag_im = diag_mask[0].detach().cpu().clone().int()
+                                        self._log_attention_mask(
+                                            pl_module,
+                                            diag_im,
+                                            step,
+                                            layer_index,
+                                            f"diag_{diag_key}_{prefix_suffix}",
+                                            query_phi=query_sample,
+                                            key_phi=key_sample,
+                                            query_mask=query_mask_sample,
+                                            invalid_mask=invalid_mask_sample,
+                                        )
 
                     # Log attention weights if present
-                    fwd_attn_weights = l_out.get("fwd_ca_attn_weights")
-                    if fwd_attn_weights is not None:
-                        self._log_attention_weights(
-                            pl_module,
-                            fwd_attn_weights[0].detach().cpu(),
-                            step,
-                            layer_index,
-                            f"fwd_ca_attn_weights_{prefix_suffix}",
-                            query_phi=query_sample,
-                            key_phi=key_sample,
-                        )
+                    if self.log_attn_weights:
+                        fwd_attn_weights = l_out.get("fwd_ca_attn_weights")
+                        if fwd_attn_weights is not None:
+                            self._log_attention_weights(
+                                pl_module,
+                                fwd_attn_weights[0].detach().cpu(),
+                                step,
+                                layer_index,
+                                f"fwd_ca_attn_weights_{prefix_suffix}",
+                                query_phi=query_sample,
+                                key_phi=key_sample,
+                            )
 
-                    bidi_attn_weights = l_out.get("bidi_ca_attn_weights")
-                    if bidi_attn_weights is not None:
-                        # Note: for bidi CA, rows are keys, cols are queries
-                        self._log_attention_weights(
-                            pl_module,
-                            bidi_attn_weights[0].detach().cpu(),
-                            step,
-                            layer_index,
-                            f"bidi_ca_attn_weights_{prefix_suffix}",
-                            query_phi=key_sample,  # Rows are keys
-                            key_phi=query_sample,  # Cols are queries
-                        )
+                        bidi_attn_weights = l_out.get("bidi_ca_attn_weights")
+                        if bidi_attn_weights is not None:
+                            # Note: for bidi CA, rows are keys, cols are queries
+                            self._log_attention_weights(
+                                pl_module,
+                                bidi_attn_weights[0].detach().cpu(),
+                                step,
+                                layer_index,
+                                f"bidi_ca_attn_weights_{prefix_suffix}",
+                                query_phi=key_sample,  # Rows are keys
+                                key_phi=query_sample,  # Cols are queries
+                            )
                     if step > 10000:
                         self._log_mask_points_for_kde(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
                     if self.log_stats:
