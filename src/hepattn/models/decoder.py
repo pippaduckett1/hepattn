@@ -596,6 +596,11 @@ class MaskFormerDecoder(nn.Module):
 
             if self.log_diagnostic_task_masks:
                 # Diagnostic mode: run decoder layer operations step-by-step to log task masks
+                # Enable attention weight logging for this layer
+                decoder_layer.q_ca.fn.log_attn_weights = True
+                if decoder_layer.bidirectional_ca:
+                    decoder_layer.kv_ca.fn.log_attn_weights = True
+
                 # Step 1: Forward cross-attention (q_ca)
                 q_pe = x["query_embed"] if query_posenc is None else x["query_embed"] + decoder_layer.scale_pe * query_posenc
                 kv_pe = x["key_embed"] if key_posenc is None else x["key_embed"] + decoder_layer.scale_pe * key_posenc
@@ -603,6 +608,12 @@ class MaskFormerDecoder(nn.Module):
                     q_pe, k=kv_pe, v=x["key_embed"], attn_mask=layer_attn_mask, attn_bias=layer_attn_bias, q_mask=q_mask, kv_mask=x.get("key_valid")
                 )
                 q_after_ca = decoder_layer.q_dense(q_after_ca)
+
+                # Log forward CA attention weights
+                if decoder_layer.q_ca.fn.last_attn_weights is not None:
+                    # Average over heads for visualization: (B, H, Q, K) -> (B, Q, K)
+                    fwd_attn_weights = decoder_layer.q_ca.fn.last_attn_weights.mean(dim=1)
+                    outputs[f"layer_{layer_index}"]["fwd_ca_attn_weights"] = fwd_attn_weights.detach().clone()
 
                 # Log task mask after forward CA
                 x_temp = {**x, "query_embed": q_after_ca}
@@ -654,6 +665,17 @@ class MaskFormerDecoder(nn.Module):
                         kv_mask=q_mask,
                     )
                     kv_after_bidi = decoder_layer.kv_dense(kv_after_bidi)
+
+                    # Log bidirectional CA attention weights
+                    if decoder_layer.kv_ca.fn.last_attn_weights is not None:
+                        # Average over heads for visualization: (B, H, K, Q) -> (B, K, Q)
+                        bidi_attn_weights = decoder_layer.kv_ca.fn.last_attn_weights.mean(dim=1)
+                        outputs[f"layer_{layer_index}"]["bidi_ca_attn_weights"] = bidi_attn_weights.detach().clone()
+
+                # Disable attention weight logging after use
+                decoder_layer.q_ca.fn.log_attn_weights = False
+                if decoder_layer.bidirectional_ca:
+                    decoder_layer.kv_ca.fn.log_attn_weights = False
 
                 # Log task mask after bidirectional CA
                 x_temp = {**x, "query_embed": q_after_sa, "key_embed": kv_after_bidi}

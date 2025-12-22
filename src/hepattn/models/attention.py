@@ -205,6 +205,10 @@ class Attention(nn.Module):
         if window_size and not self.window_size:
             raise ValueError("window_size not set correctly")
 
+        # For diagnostic logging of attention weights
+        self.log_attn_weights = False
+        self.last_attn_weights: Tensor | None = None
+
     def reset_parameters(self):
         """Initialize the parameters."""
         nn.init.xavier_uniform_(self.in_proj_weight)
@@ -238,6 +242,31 @@ class Attention(nn.Module):
         if self.attn_type not in FLASH_ATTN_TYPES:
             x = x.transpose(-3, -2)  # B H S Dh -> B S H Dh
         return x.flatten(-2)  # B S H Dh -> B S D
+
+    def _compute_attn_weights(self, q: Tensor, k: Tensor, attn_mask: Tensor | None) -> Tensor:
+        """Compute attention weights for diagnostic logging.
+
+        Args:
+            q: Query tensor of shape (B, H, N, Dh).
+            k: Key tensor of shape (B, H, M, Dh).
+            attn_mask: Optional attention mask/bias of shape (B, H, N, M) or (B, 1, N, M).
+
+        Returns:
+            Attention weights of shape (B, H, N, M) after softmax.
+        """
+        scale = q.shape[-1] ** -0.5
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, N, M)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                # Boolean mask: True = attend, False = mask out
+                attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
+            else:
+                # Float mask/bias: add directly (already has -inf for masked positions)
+                attn_scores = attn_scores + attn_mask
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        return attn_weights.detach()
 
     def _prepare_qkv(
         self,
@@ -400,6 +429,11 @@ class Attention(nn.Module):
                     attn_bias = attn_bias.masked_fill(~attn_mask, float("-inf"))
 
                 attn_mask = attn_bias
+
+            # Optionally compute and store attention weights for diagnostic logging
+            if self.log_attn_weights:
+                self.last_attn_weights = self._compute_attn_weights(q, k, attn_mask)
+
             out = self.attn(q, k, v, attn_mask=attn_mask)
         elif self.attn_type == "flash":
             out = self.attn(q, k, v, window_size=self.window_size)

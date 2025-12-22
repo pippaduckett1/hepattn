@@ -128,6 +128,59 @@ class AttnMaskLogger(Callback):
             logger.experiment.log_figure(figure_name=f"{prefix}_step{step}_layer{layer}", figure=fig, step=step)
         plt.close(fig)
 
+    def _log_attention_weights(
+        self,
+        pl_module,
+        weights,
+        step,
+        layer,
+        prefix="attn_weights",
+        query_phi=None,
+        key_phi=None,
+    ):
+        """Log attention weights as a heatmap."""
+        fig, ax = plt.subplots(constrained_layout=True, dpi=300)
+
+        # Use a continuous colormap for weights
+        im = ax.imshow(weights.numpy(), aspect="auto", cmap="viridis", vmin=0, interpolation="nearest")
+
+        # Determine phi ordering for axis inversion
+        query_phi_ascending = True
+        key_phi_ascending = True
+        if query_phi is not None and query_phi.numel() > 1:
+            query_phi_ascending = query_phi[-1].item() > query_phi[0].item()
+        if key_phi is not None and key_phi.numel() > 1:
+            key_phi_ascending = key_phi[-1].item() > key_phi[0].item()
+
+        if query_phi_ascending:
+            ax.invert_yaxis()
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label("Attention Weight", rotation=270, labelpad=15)
+
+        ax.set_title(f"Attention Weights - Step {step}, Layer {layer}")
+
+        x_arrow = "→" if key_phi_ascending else "←"
+        y_arrow = "↑" if query_phi_ascending else "↓"
+        ax.set_xlabel(f"Keys ({x_arrow} increasing φ)")
+        ax.set_ylabel(f"Queries ({y_arrow} increasing φ)")
+
+        if key_phi is not None and key_phi.numel() == weights.shape[1]:
+            tick_idx = np.linspace(0, weights.shape[1] - 1, num=min(6, weights.shape[1]), dtype=int)
+            ax.set_xticks(tick_idx)
+            xticklabels = [f"{key_phi[idx].item():.2f}" for idx in tick_idx]
+            ax.set_xticklabels(xticklabels, rotation=45, ha="right")
+        if query_phi is not None and query_phi.numel() == weights.shape[0]:
+            tick_idy = np.linspace(0, weights.shape[0] - 1, num=min(6, weights.shape[0]), dtype=int)
+            ax.set_yticks(tick_idy)
+            yticklabels = [f"{query_phi[idx].item():.2f}" for idx in tick_idy]
+            ax.set_yticklabels(yticklabels)
+
+        logger = getattr(pl_module, "logger", None)
+        if logger is not None and hasattr(logger, "experiment"):
+            logger.experiment.log_figure(figure_name=f"{prefix}_step{step}_layer{layer}", figure=fig, step=step)
+        plt.close(fig)
+
     def _log_attention_stats(self, pl_module, mask, step, layer, prefix="val"):
         """Log basic attention mask statistics."""
         try:
@@ -657,6 +710,32 @@ class AttnMaskLogger(Callback):
                                         query_mask=query_mask_sample,
                                         invalid_mask=invalid_mask_sample,
                                     )
+
+                    # Log attention weights if present
+                    fwd_attn_weights = l_out.get("fwd_ca_attn_weights")
+                    if fwd_attn_weights is not None:
+                        self._log_attention_weights(
+                            pl_module,
+                            fwd_attn_weights[0].detach().cpu(),
+                            step,
+                            layer_index,
+                            f"fwd_ca_attn_weights_{prefix_suffix}",
+                            query_phi=query_sample,
+                            key_phi=key_sample,
+                        )
+
+                    bidi_attn_weights = l_out.get("bidi_ca_attn_weights")
+                    if bidi_attn_weights is not None:
+                        # Note: for bidi CA, rows are keys, cols are queries
+                        self._log_attention_weights(
+                            pl_module,
+                            bidi_attn_weights[0].detach().cpu(),
+                            step,
+                            layer_index,
+                            f"bidi_ca_attn_weights_{prefix_suffix}",
+                            query_phi=key_sample,  # Rows are keys
+                            key_phi=query_sample,  # Cols are queries
+                        )
                     if step > 10000:
                         self._log_mask_points_for_kde(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
                     if self.log_stats:
