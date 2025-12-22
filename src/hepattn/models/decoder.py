@@ -81,6 +81,7 @@ class MaskFormerDecoder(nn.Module):
         bidirectional_ca_local_window_scale: float = 0.25,
         dynamic_queries: bool = False,
         log_diagnostic_task_masks: bool = False,
+        diagnostic_log_interval: int = 1000,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -275,6 +276,8 @@ class MaskFormerDecoder(nn.Module):
 
         # Diagnostic mode: log task masks at multiple points within each layer
         self.log_diagnostic_task_masks = log_diagnostic_task_masks
+        self.diagnostic_log_interval = int(diagnostic_log_interval)
+        self._forward_count = 0  # Counter for controlling diagnostic logging frequency
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -289,6 +292,10 @@ class MaskFormerDecoder(nn.Module):
         Raises:
             ValueError: If in merged input mode and multiple attention masks are provided.
         """
+        # Increment forward counter and check if we should do diagnostic logging this step
+        self._forward_count += 1
+        do_diagnostic_logging = self.log_diagnostic_task_masks and (self._forward_count % self.diagnostic_log_interval == 0)
+
         batch_size = x["key_embed"].shape[0]
         num_constituents = x["key_embed"].shape[-2]
 
@@ -594,7 +601,7 @@ class MaskFormerDecoder(nn.Module):
             query_posenc = x["query_posenc"] if (self.posenc and self.add_pe_in_attn) else None
             key_posenc = x["key_posenc"] if (self.posenc and self.add_pe_in_attn) else None
 
-            if self.log_diagnostic_task_masks:
+            if do_diagnostic_logging:
                 # Diagnostic mode: run decoder layer operations step-by-step to log task masks
                 # Enable attention weight logging for this layer
                 decoder_layer.q_ca.fn.log_attn_weights = True
@@ -612,8 +619,11 @@ class MaskFormerDecoder(nn.Module):
                 # Log forward CA attention weights
                 if decoder_layer.q_ca.fn.last_attn_weights is not None:
                     # Average over heads for visualization: (B, H, Q, K) -> (B, Q, K)
+                    # Weights are already on CPU from _compute_attn_weights
                     fwd_attn_weights = decoder_layer.q_ca.fn.last_attn_weights.mean(dim=1)
-                    outputs[f"layer_{layer_index}"]["fwd_ca_attn_weights"] = fwd_attn_weights.detach().clone()
+                    outputs[f"layer_{layer_index}"]["fwd_ca_attn_weights"] = fwd_attn_weights
+                    # Clear immediately to free memory
+                    decoder_layer.q_ca.fn.last_attn_weights = None
 
                 # Log task mask after forward CA
                 x_temp = {**x, "query_embed": q_after_ca}
@@ -669,8 +679,11 @@ class MaskFormerDecoder(nn.Module):
                     # Log bidirectional CA attention weights
                     if decoder_layer.kv_ca.fn.last_attn_weights is not None:
                         # Average over heads for visualization: (B, H, K, Q) -> (B, K, Q)
+                        # Weights are already on CPU from _compute_attn_weights
                         bidi_attn_weights = decoder_layer.kv_ca.fn.last_attn_weights.mean(dim=1)
-                        outputs[f"layer_{layer_index}"]["bidi_ca_attn_weights"] = bidi_attn_weights.detach().clone()
+                        outputs[f"layer_{layer_index}"]["bidi_ca_attn_weights"] = bidi_attn_weights
+                        # Clear immediately to free memory
+                        decoder_layer.kv_ca.fn.last_attn_weights = None
 
                 # Disable attention weight logging after use
                 decoder_layer.q_ca.fn.log_attn_weights = False
@@ -724,7 +737,7 @@ class MaskFormerDecoder(nn.Module):
             stage_name: Name of the stage (for logging).
 
         Returns:
-            Dictionary with task mask tensors, or None if no mask tasks.
+            Dictionary with task mask tensors on CPU, or None if no mask tasks.
         """
         if self.tasks is None:
             return None
@@ -736,7 +749,8 @@ class MaskFormerDecoder(nn.Module):
                 task_outputs = task(x)
                 task_attn_masks = task.attn_mask(task_outputs)
                 for input_name, mask in task_attn_masks.items():
-                    result[f"{stage_name}_{task.name}_{input_name}"] = mask.detach().clone()
+                    # Move to CPU immediately to avoid GPU memory buildup
+                    result[f"{stage_name}_{task.name}_{input_name}"] = mask.detach().cpu()
         return result if result else None
 
     def flex_local_ca_mask(

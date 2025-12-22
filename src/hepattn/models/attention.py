@@ -252,7 +252,7 @@ class Attention(nn.Module):
             attn_mask: Optional attention mask/bias of shape (B, H, N, M) or (B, 1, N, M).
 
         Returns:
-            Attention weights of shape (B, H, N, M) after softmax.
+            Attention weights of shape (B, H, N, M) after softmax, moved to CPU to save GPU memory.
         """
         scale = q.shape[-1] ** -0.5
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, N, M)
@@ -266,7 +266,8 @@ class Attention(nn.Module):
                 attn_scores = attn_scores + attn_mask
 
         attn_weights = F.softmax(attn_scores, dim=-1)
-        return attn_weights.detach()
+        # Move to CPU immediately to avoid GPU memory buildup
+        return attn_weights.detach().cpu()
 
     def _prepare_qkv(
         self,
