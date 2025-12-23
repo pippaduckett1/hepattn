@@ -730,6 +730,7 @@ class AttnMaskLogger(Callback):
                         fwd_attn_weights = l_out.get("fwd_ca_attn_weights")
                         print(f"[CALLBACK] Layer {layer_index}: fwd_ca_attn_weights exists={fwd_attn_weights is not None}")
                         if fwd_attn_weights is not None:
+                            print(f"[CALLBACK] Layer {layer_index}: LOGGING fwd_ca_attn_weights to Comet as 'fwd_ca_attn_weights_{prefix_suffix}_step{step}_layer{layer_index}'")
                             self._log_attention_weights(
                                 pl_module,
                                 fwd_attn_weights[0].detach().cpu(),
