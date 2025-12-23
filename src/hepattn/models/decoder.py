@@ -294,6 +294,8 @@ class MaskFormerDecoder(nn.Module):
         """
         # Check if we should do diagnostic logging this step (before incrementing to align with 0-indexed batch_idx)
         do_diagnostic_logging = self.log_diagnostic_task_masks and (self._forward_count % self.diagnostic_log_interval == 0)
+        if do_diagnostic_logging:
+            print(f"[DIAGNOSTIC] Forward {self._forward_count}: DIAGNOSTIC LOGGING ENABLED (interval={self.diagnostic_log_interval})")
         self._forward_count += 1
 
         batch_size = x["key_embed"].shape[0]
@@ -604,9 +606,11 @@ class MaskFormerDecoder(nn.Module):
             if do_diagnostic_logging:
                 # Diagnostic mode: run decoder layer operations step-by-step to log task masks
                 # Enable attention weight logging for this layer
+                print(f"[DIAGNOSTIC] Layer {layer_index}: Enabling attention weight logging")
                 decoder_layer.q_ca.fn.log_attn_weights = True
                 if decoder_layer.bidirectional_ca:
                     decoder_layer.kv_ca.fn.log_attn_weights = True
+                    print(f"[DIAGNOSTIC] Layer {layer_index}: Bidirectional CA enabled")
 
                 # Step 1: Forward cross-attention (q_ca)
                 q_pe = x["query_embed"] if query_posenc is None else x["query_embed"] + decoder_layer.scale_pe * query_posenc
@@ -617,13 +621,17 @@ class MaskFormerDecoder(nn.Module):
                 q_after_ca = decoder_layer.q_dense(q_after_ca)
 
                 # Log forward CA attention weights
+                print(f"[DIAGNOSTIC] Layer {layer_index}: Checking for fwd CA weights, exists={decoder_layer.q_ca.fn.last_attn_weights is not None}")
                 if decoder_layer.q_ca.fn.last_attn_weights is not None:
                     # Average over heads for visualization: (B, H, Q, K) -> (B, Q, K)
                     # Weights are already on CPU from _compute_attn_weights
                     fwd_attn_weights = decoder_layer.q_ca.fn.last_attn_weights.mean(dim=1)
                     outputs[f"layer_{layer_index}"]["fwd_ca_attn_weights"] = fwd_attn_weights
+                    print(f"[DIAGNOSTIC] Layer {layer_index}: Stored fwd_ca_attn_weights with shape {fwd_attn_weights.shape}")
                     # Clear immediately to free memory
                     decoder_layer.q_ca.fn.last_attn_weights = None
+                else:
+                    print(f"[DIAGNOSTIC] Layer {layer_index}: WARNING - No fwd CA weights found!")
 
                 # Log task mask after forward CA
                 x_temp = {**x, "query_embed": q_after_ca}
@@ -677,13 +685,19 @@ class MaskFormerDecoder(nn.Module):
                     kv_after_bidi = decoder_layer.kv_dense(kv_after_bidi)
 
                     # Log bidirectional CA attention weights
+                    print(
+                        f"[DIAGNOSTIC] Layer {layer_index}: Checking for bidi CA weights, exists={decoder_layer.kv_ca.fn.last_attn_weights is not None}"
+                    )
                     if decoder_layer.kv_ca.fn.last_attn_weights is not None:
                         # Average over heads for visualization: (B, H, K, Q) -> (B, K, Q)
                         # Weights are already on CPU from _compute_attn_weights
                         bidi_attn_weights = decoder_layer.kv_ca.fn.last_attn_weights.mean(dim=1)
                         outputs[f"layer_{layer_index}"]["bidi_ca_attn_weights"] = bidi_attn_weights
+                        print(f"[DIAGNOSTIC] Layer {layer_index}: Stored bidi_ca_attn_weights with shape {bidi_attn_weights.shape}")
                         # Clear immediately to free memory
                         decoder_layer.kv_ca.fn.last_attn_weights = None
+                    else:
+                        print(f"[DIAGNOSTIC] Layer {layer_index}: WARNING - No bidi CA weights found!")
 
                 # Disable attention weight logging after use
                 decoder_layer.q_ca.fn.log_attn_weights = False

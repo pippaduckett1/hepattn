@@ -434,6 +434,7 @@ class Attention(nn.Module):
             # Optionally compute and store attention weights for diagnostic logging
             if self.log_attn_weights:
                 self.last_attn_weights = self._compute_attn_weights(q, k, attn_mask)
+                print(f"[ATTENTION] Computed attention weights with shape {self.last_attn_weights.shape}")
 
             out = self.attn(q, k, v, attn_mask=attn_mask)
         elif self.attn_type == "flash":

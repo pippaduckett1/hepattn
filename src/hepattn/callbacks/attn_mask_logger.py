@@ -728,6 +728,7 @@ class AttnMaskLogger(Callback):
                     # Log attention weights if present
                     if self.log_attn_weights:
                         fwd_attn_weights = l_out.get("fwd_ca_attn_weights")
+                        print(f"[CALLBACK] Layer {layer_index}: fwd_ca_attn_weights exists={fwd_attn_weights is not None}")
                         if fwd_attn_weights is not None:
                             self._log_attention_weights(
                                 pl_module,
