@@ -150,10 +150,13 @@ class AttnMaskLogger(Callback):
         key_phi=None,
     ):
         """Log attention weights as a heatmap."""
-        fig, ax = plt.subplots(constrained_layout=True, dpi=300)
+        try:
+            print(f"[ATTN_WEIGHTS] Creating figure for {prefix}_step{step}_layer{layer}, weights shape: {weights.shape}")
+            fig, ax = plt.subplots(constrained_layout=True, dpi=300)
 
-        # Use a continuous colormap for weights
-        im = ax.imshow(weights.numpy(), aspect="auto", cmap="viridis", vmin=0, interpolation="nearest")
+            # Use a continuous colormap for weights
+            im = ax.imshow(weights.numpy(), aspect="auto", cmap="viridis", vmin=0, interpolation="nearest")
+            print(f"[ATTN_WEIGHTS] imshow complete")
 
         # Determine phi ordering for axis inversion
         query_phi_ascending = True
@@ -187,10 +190,20 @@ class AttnMaskLogger(Callback):
             yticklabels = [f"{query_phi[idx].item():.2f}" for idx in tick_idy]
             ax.set_yticklabels(yticklabels)
 
-        logger = getattr(pl_module, "logger", None)
-        if logger is not None and hasattr(logger, "experiment"):
-            logger.experiment.log_figure(figure_name=f"{prefix}_step{step}_layer{layer}", figure=fig, step=step)
-        plt.close(fig)
+            logger = getattr(pl_module, "logger", None)
+            print(f"[ATTN_WEIGHTS] Logger exists: {logger is not None}, has experiment: {hasattr(logger, 'experiment') if logger else False}")
+            if logger is not None and hasattr(logger, "experiment"):
+                figure_name = f"{prefix}_step{step}_layer{layer}"
+                print(f"[ATTN_WEIGHTS] Calling log_figure with name: {figure_name}")
+                logger.experiment.log_figure(figure_name=figure_name, figure=fig, step=step)
+                print(f"[ATTN_WEIGHTS] log_figure completed successfully")
+            else:
+                print(f"[ATTN_WEIGHTS] WARNING: No logger available!")
+            plt.close(fig)
+        except Exception as e:
+            print(f"[ATTN_WEIGHTS] ERROR: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _log_attention_stats(self, pl_module, mask, step, layer, prefix="val"):
         """Log basic attention mask statistics."""
