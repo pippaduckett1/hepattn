@@ -106,6 +106,11 @@ class ModelWrapper(LightningModule):
 
         # Store outputs for callbacks to access (needed when MTL returns None)
         self._last_outputs = outputs
+        
+        # Store diagnostic outputs separately (only when they contain attention weights)
+        # This prevents them from being overwritten by non-diagnostic batches
+        if any("fwd_ca_attn_weights" in v for k, v in outputs.items() if isinstance(v, dict)):
+            self._diagnostic_outputs = outputs
 
         if self.mtl:
             self.mlt_opt(losses, outputs)

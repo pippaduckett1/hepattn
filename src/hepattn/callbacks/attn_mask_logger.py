@@ -887,6 +887,21 @@ class AttnMaskLogger(Callback):
             print(f"[CALLBACK] batch_idx={batch_idx}: No outputs available, skipping")
             return
         
+        # For attention weights, use diagnostic outputs which are stored separately
+        # and not overwritten by non-diagnostic batches
+        diagnostic_outputs = getattr(pl_module, "_diagnostic_outputs", None)
+        if diagnostic_outputs is not None:
+            # Merge diagnostic attention weights into current outputs for logging
+            for layer_key in diagnostic_outputs:
+                if layer_key.startswith("layer_") and isinstance(diagnostic_outputs[layer_key], dict):
+                    if layer_key not in outputs:
+                        outputs[layer_key] = {}
+                    for weight_key in ["fwd_ca_attn_weights", "bidi_ca_attn_weights"]:
+                        if weight_key in diagnostic_outputs[layer_key]:
+                            outputs[layer_key][weight_key] = diagnostic_outputs[layer_key][weight_key]
+            # Clear diagnostic outputs after using them to avoid re-logging
+            pl_module._diagnostic_outputs = None
+        
         self._process_attention_masks_from_outputs(pl_module, outputs, step, is_validation=False)
 
     def _log_mask_points_for_kde(self, pl_module, mask, step, layer, prefix="local_ma_mask"):
