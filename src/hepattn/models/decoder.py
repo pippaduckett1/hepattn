@@ -292,9 +292,9 @@ class MaskFormerDecoder(nn.Module):
         Raises:
             ValueError: If in merged input mode and multiple attention masks are provided.
         """
-        # Increment forward counter and check if we should do diagnostic logging this step
-        self._forward_count += 1
+        # Check if we should do diagnostic logging this step (before incrementing to align with 0-indexed batch_idx)
         do_diagnostic_logging = self.log_diagnostic_task_masks and (self._forward_count % self.diagnostic_log_interval == 0)
+        self._forward_count += 1
 
         batch_size = x["key_embed"].shape[0]
         num_constituents = x["key_embed"].shape[-2]

@@ -621,8 +621,8 @@ class AttnMaskLogger(Callback):
         prefix_suffix = "_val" if is_validation else "train"
         diagnostics = outputs.get("diagnostics")
 
-        # Get only entries that contain "attn_mask"
-        layer_outputs = {k: v for k, v in outputs.items() if k != "loss" and "attn_mask" in v}
+        # Get all layer entries (those that start with "layer_")
+        layer_outputs = {k: v for k, v in outputs.items() if k.startswith("layer_") and isinstance(v, dict)}
         if not layer_outputs:
             return
 
@@ -631,7 +631,7 @@ class AttnMaskLogger(Callback):
             return
 
         for layer_name, l_out in outputs.items():
-            if layer_name != "loss" and "attn_mask" in l_out:
+            if layer_name.startswith("layer_") and isinstance(l_out, dict):
                 layer_index = int(layer_name.split("_")[1])
                 query_phi = l_out.get("query_phi")
                 key_phi = l_out.get("key_phi")
@@ -641,8 +641,8 @@ class AttnMaskLogger(Callback):
                 task_mask = l_out.get("task_attn_mask")
 
                 if self.log_all_layers or layer_index == max(layer_indices):
-                    attn_mask = l_out["attn_mask"]
-                    attn_mask_im = attn_mask[0].detach().cpu().clone().int()
+                    attn_mask = l_out.get("attn_mask")
+                    attn_mask_im = attn_mask[0].detach().cpu().clone().int() if attn_mask is not None else None
                     query_sample = query_phi[0].detach().cpu() if query_phi is not None else None
                     key_sample = key_phi[0].detach().cpu() if key_phi is not None else None
                     query_mask_sample = None
@@ -653,17 +653,18 @@ class AttnMaskLogger(Callback):
                         invalid_mask_sample = invalid_mask[0].detach().cpu().bool()
                     elif query_mask_sample is not None:
                         invalid_mask_sample = ~query_mask_sample
-                    self._log_attention_mask(
-                        pl_module,
-                        attn_mask_im,
-                        step,
-                        layer_index,
-                        f"local_ma_mask_{prefix_suffix}",
-                        query_phi=query_sample,
-                        key_phi=key_sample,
-                        query_mask=query_mask_sample,
-                        invalid_mask=invalid_mask_sample,
-                    )
+                    if attn_mask_im is not None:
+                        self._log_attention_mask(
+                            pl_module,
+                            attn_mask_im,
+                            step,
+                            layer_index,
+                            f"local_ma_mask_{prefix_suffix}",
+                            query_phi=query_sample,
+                            key_phi=key_sample,
+                            query_mask=query_mask_sample,
+                            invalid_mask=invalid_mask_sample,
+                        )
                     if self.log_kv_mask:
                         kv_mask = l_out.get("attn_mask_kv")
                         if kv_mask is not None:
@@ -750,14 +751,15 @@ class AttnMaskLogger(Callback):
                                 query_phi=key_sample,  # Rows are keys
                                 key_phi=query_sample,  # Cols are queries
                             )
-                    if step > 10000:
-                        self._log_mask_points_for_kde(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
-                    if self.log_stats:
-                        self._log_attention_stats(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
+                    if attn_mask_im is not None:
+                        if step > 10000:
+                            self._log_mask_points_for_kde(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
+                        if self.log_stats:
+                            self._log_attention_stats(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
 
-                    # Log diagonal metrics if enabled
-                    if self.log_diagonal_metrics:
-                        self._log_diagonal_metrics(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
+                        # Log diagonal metrics if enabled
+                        if self.log_diagonal_metrics:
+                            self._log_diagonal_metrics(pl_module, attn_mask_im, step, layer_index, f"local_ma_mask_{prefix_suffix}")
 
                     if self.log_query_phi_metrics and query_phi is not None:
                         key_sample = key_phi[0] if key_phi is not None else None
@@ -770,7 +772,7 @@ class AttnMaskLogger(Callback):
                             f"local_ma_mask_{prefix_suffix}",
                         )
 
-                    if self.log_diagonal_regression:
+                    if self.log_diagonal_regression and attn_mask_im is not None:
                         self._log_diagonal_regression_metrics(
                             pl_module,
                             attn_mask_im,
@@ -789,7 +791,7 @@ class AttnMaskLogger(Callback):
                             f"local_ma_mask_{prefix_suffix}",
                         )
 
-                    if self.log_phi_distance_mask and query_phi is not None and key_phi is not None:
+                    if self.log_phi_distance_mask and query_phi is not None and key_phi is not None and attn_mask_im is not None:
                         self._log_phi_distance_mask(
                             pl_module,
                             query_sample,
