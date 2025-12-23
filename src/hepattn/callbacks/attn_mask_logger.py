@@ -876,6 +876,17 @@ class AttnMaskLogger(Callback):
         if batch_idx % self.log_every_n_batches != 0:
             return
         step = getattr(trainer, "global_step", batch_idx)
+        
+        # If outputs is None (e.g., MTL mode), try to get stored outputs from pl_module
+        if outputs is None or not isinstance(outputs, dict):
+            outputs = getattr(pl_module, "_last_outputs", None)
+            if outputs is not None:
+                print(f"[CALLBACK] batch_idx={batch_idx}: Using _last_outputs from pl_module")
+        
+        if outputs is None:
+            print(f"[CALLBACK] batch_idx={batch_idx}: No outputs available, skipping")
+            return
+        
         self._process_attention_masks_from_outputs(pl_module, outputs, step, is_validation=False)
 
     def _log_mask_points_for_kde(self, pl_module, mask, step, layer, prefix="local_ma_mask"):

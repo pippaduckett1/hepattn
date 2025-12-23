@@ -104,6 +104,9 @@ class ModelWrapper(LightningModule):
             preds = self.predict(outputs)
             self.log_metrics(preds, targets, "train")
 
+        # Store outputs for callbacks to access (needed when MTL returns None)
+        self._last_outputs = outputs
+
         if self.mtl:
             self.mlt_opt(losses, outputs)
             return None
