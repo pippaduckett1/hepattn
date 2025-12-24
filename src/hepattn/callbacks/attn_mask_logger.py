@@ -77,67 +77,104 @@ class AttnMaskLogger(Callback):
         invalid_mask=None,
     ):
         """Helper method to create and log attention mask figures."""
-        fig, ax = plt.subplots(constrained_layout=True, dpi=300)
-        cmap = ListedColormap(["#002b7f", "#ffff33"])  # blue for 0, yellow for 1
-        im = ax.imshow(mask.numpy().astype(int), aspect="auto", cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
+        fig = None
+        try:
+            # Ensure mask is 2D and on CPU
+            mask_2d = self._ensure_2d_cpu(mask)
+            query_phi_1d = self._ensure_1d_cpu(query_phi)
+            key_phi_1d = self._ensure_1d_cpu(key_phi)
 
-        # Determine if phi is ascending or descending with index
-        query_phi_ascending = True
-        key_phi_ascending = True
-        if query_phi is not None and query_phi.numel() > 1:
-            query_phi_ascending = query_phi[-1].item() > query_phi[0].item()
-        if key_phi is not None and key_phi.numel() > 1:
-            key_phi_ascending = key_phi[-1].item() > key_phi[0].item()
+            fig, ax = plt.subplots(constrained_layout=True, dpi=300)
+            cmap = ListedColormap(["#002b7f", "#ffff33"])  # blue for 0, yellow for 1
+            im = ax.imshow(mask_2d.numpy().astype(int), aspect="auto", cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
 
-        # Flip y-axis so lowest phi is at the bottom (only if phi is ascending with index)
-        if query_phi_ascending:
-            ax.invert_yaxis()
+            # Determine if phi is ascending or descending with index
+            query_phi_ascending = True
+            key_phi_ascending = True
+            if query_phi_1d is not None and query_phi_1d.numel() > 1:
+                query_phi_ascending = query_phi_1d[-1].item() > query_phi_1d[0].item()
+            if key_phi_1d is not None and key_phi_1d.numel() > 1:
+                key_phi_ascending = key_phi_1d[-1].item() > key_phi_1d[0].item()
 
-        # Add colorbar with clear labels
-        cbar = plt.colorbar(im, ax=ax, ticks=[0, 1])
-        cbar.set_label("Attention Mask", rotation=270, labelpad=15)
-        cbar.ax.set_yticklabels(["Masked (0)", "Used in Attention (1)"])
+            # Flip y-axis so lowest phi is at the bottom (only if phi is ascending with index)
+            if query_phi_ascending:
+                ax.invert_yaxis()
 
-        # Add title with step and layer info
-        ax.set_title(f"Attention Mask - Step {step}, Layer {layer}")
+            # Add colorbar with clear labels
+            cbar = plt.colorbar(im, ax=ax, ticks=[0, 1])
+            cbar.set_label("Attention Mask", rotation=270, labelpad=15)
+            cbar.ax.set_yticklabels(["Masked (0)", "Used in Attention (1)"])
 
-        # Add arrows to axis labels to indicate phi direction
-        x_arrow = "→" if key_phi_ascending else "←"
-        y_arrow = "↑" if query_phi_ascending else "↓"
-        ax.set_xlabel(f"Hits ({x_arrow} increasing φ)")
-        ax.set_ylabel(f"Queries ({y_arrow} increasing φ)")
+            # Add title with step and layer info
+            ax.set_title(f"Attention Mask - Step {step}, Layer {layer}")
 
-        if key_phi is not None and key_phi.numel() == mask.shape[1]:
-            tick_idx = np.linspace(0, mask.shape[1] - 1, num=min(6, mask.shape[1]), dtype=int)
-            ax.set_xticks(tick_idx)
-            xticklabels = [f"{key_phi[idx].item():.2f}" for idx in tick_idx]
-            ax.set_xticklabels(xticklabels, rotation=45, ha="right")
-        if query_phi is not None and query_phi.numel() == mask.shape[0]:
-            tick_idy = np.linspace(0, mask.shape[0] - 1, num=min(6, mask.shape[0]), dtype=int)
-            ax.set_yticks(tick_idy)
-            yticklabels = [f"{query_phi[idx].item():.2f}" for idx in tick_idy]
-            ax.set_yticklabels(yticklabels)
-        overlay_mask = None
-        if invalid_mask is not None:
-            overlay_mask = invalid_mask
-        elif query_mask is not None:
-            overlay_mask = ~query_mask
-        if overlay_mask is not None:
-            if isinstance(overlay_mask, torch.Tensor):
-                overlay_np = overlay_mask.detach().cpu().numpy().astype(bool)
-            else:
-                overlay_np = np.array(overlay_mask, dtype=bool)
-            if overlay_np.ndim > 0 and overlay_np.shape[0] == mask.shape[0]:
-                invalid_idx = np.where(overlay_np)[0]
-                for idx in invalid_idx:
-                    # Draw a visual overlay to mark invalid queries - this does NOT mask the data
-                    # Using magenta/purple color to distinguish from the attention mask colors
-                    ax.axhspan(idx - 0.5, idx + 0.5, color="magenta", alpha=0.3, linewidth=0)
-        # Log directly to Comet
-        logger = getattr(pl_module, "logger", None)
-        if logger is not None and hasattr(logger, "experiment"):
-            logger.experiment.log_figure(figure_name=f"{prefix}_step{step}_layer{layer}", figure=fig, step=step)
-        plt.close(fig)
+            # Add arrows to axis labels to indicate phi direction
+            x_arrow = "→" if key_phi_ascending else "←"
+            y_arrow = "↑" if query_phi_ascending else "↓"
+            ax.set_xlabel(f"Hits ({x_arrow} increasing φ)")
+            ax.set_ylabel(f"Queries ({y_arrow} increasing φ)")
+
+            if key_phi_1d is not None and key_phi_1d.numel() == mask_2d.shape[1]:
+                tick_idx = np.linspace(0, mask_2d.shape[1] - 1, num=min(6, mask_2d.shape[1]), dtype=int)
+                ax.set_xticks(tick_idx)
+                xticklabels = [f"{key_phi_1d[idx].item():.2f}" for idx in tick_idx]
+                ax.set_xticklabels(xticklabels, rotation=45, ha="right")
+            if query_phi_1d is not None and query_phi_1d.numel() == mask_2d.shape[0]:
+                tick_idy = np.linspace(0, mask_2d.shape[0] - 1, num=min(6, mask_2d.shape[0]), dtype=int)
+                ax.set_yticks(tick_idy)
+                yticklabels = [f"{query_phi_1d[idx].item():.2f}" for idx in tick_idy]
+                ax.set_yticklabels(yticklabels)
+            overlay_mask = None
+            if invalid_mask is not None:
+                overlay_mask = invalid_mask
+            elif query_mask is not None:
+                overlay_mask = ~query_mask
+            if overlay_mask is not None:
+                if isinstance(overlay_mask, torch.Tensor):
+                    overlay_1d = self._ensure_1d_cpu(overlay_mask)
+                    overlay_np = overlay_1d.numpy().astype(bool) if overlay_1d is not None else None
+                else:
+                    overlay_np = np.array(overlay_mask, dtype=bool)
+                if overlay_np is not None and overlay_np.ndim > 0 and overlay_np.shape[0] == mask_2d.shape[0]:
+                    invalid_idx = np.where(overlay_np)[0]
+                    for idx in invalid_idx:
+                        # Draw a visual overlay to mark invalid queries - this does NOT mask the data
+                        # Using magenta/purple color to distinguish from the attention mask colors
+                        ax.axhspan(idx - 0.5, idx + 0.5, color="magenta", alpha=0.3, linewidth=0)
+            # Log directly to Comet
+            logger = getattr(pl_module, "logger", None)
+            if logger is not None and hasattr(logger, "experiment"):
+                logger.experiment.log_figure(figure_name=f"{prefix}_step{step}_layer{layer}", figure=fig, step=step)
+        except Exception as e:
+            print(f"[ATTN_MASK] ERROR in _log_attention_mask: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            if fig is not None:
+                plt.close(fig)
+
+    def _ensure_1d_cpu(self, tensor):
+        """Ensure tensor is 1D and on CPU, handling batch dimensions."""
+        if tensor is None:
+            return None
+        t = tensor.detach()
+        # Remove batch dimension if present
+        while t.dim() > 1:
+            t = t[0] if t.shape[0] == 1 else t.squeeze(0)
+        # Move to CPU if needed
+        return t.cpu() if t.is_cuda else t
+
+    def _ensure_2d_cpu(self, tensor):
+        """Ensure tensor is 2D and on CPU, handling batch dimensions."""
+        if tensor is None:
+            return None
+        t = tensor.detach()
+        # Remove batch dimension if present (keep last 2 dims)
+        while t.dim() > 2:
+            t = t[0] if t.shape[0] == 1 else t.squeeze(0)
+        # Move to CPU if needed
+        return t.cpu() if t.is_cuda else t
 
     def _log_attention_weights(
         self,
@@ -150,55 +187,70 @@ class AttnMaskLogger(Callback):
         key_phi=None,
     ):
         """Log attention weights as a heatmap."""
-        print(f"[ATTN_WEIGHTS] Creating figure for {prefix}_step{step}_layer{layer}, weights shape: {weights.shape}")
-        fig, ax = plt.subplots(constrained_layout=True, dpi=300)
+        fig = None
+        try:
+            print(f"[ATTN_WEIGHTS] Creating figure for {prefix}_step{step}_layer{layer}, weights shape: {weights.shape}")
 
-        # Use a continuous colormap for weights
-        im = ax.imshow(weights.numpy(), aspect="auto", cmap="viridis", vmin=0, interpolation="nearest")
-        print(f"[ATTN_WEIGHTS] imshow complete")
+            # Ensure weights are 2D and on CPU
+            weights_2d = self._ensure_2d_cpu(weights)
+            query_phi_1d = self._ensure_1d_cpu(query_phi)
+            key_phi_1d = self._ensure_1d_cpu(key_phi)
 
-        # Determine phi ordering for axis inversion
-        query_phi_ascending = True
-        key_phi_ascending = True
-        if query_phi is not None and query_phi.numel() > 1:
-            query_phi_ascending = query_phi[-1].item() > query_phi[0].item()
-        if key_phi is not None and key_phi.numel() > 1:
-            key_phi_ascending = key_phi[-1].item() > key_phi[0].item()
+            fig, ax = plt.subplots(constrained_layout=True, dpi=300)
 
-        if query_phi_ascending:
-            ax.invert_yaxis()
+            # Use a continuous colormap for weights
+            im = ax.imshow(weights_2d.numpy(), aspect="auto", cmap="viridis", vmin=0, interpolation="nearest")
+            print(f"[ATTN_WEIGHTS] imshow complete")
 
-        cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label("Attention Weight", rotation=270, labelpad=15)
+            # Determine phi ordering for axis inversion
+            query_phi_ascending = True
+            key_phi_ascending = True
+            if query_phi_1d is not None and query_phi_1d.numel() > 1:
+                query_phi_ascending = query_phi_1d[-1].item() > query_phi_1d[0].item()
+            if key_phi_1d is not None and key_phi_1d.numel() > 1:
+                key_phi_ascending = key_phi_1d[-1].item() > key_phi_1d[0].item()
 
-        ax.set_title(f"Attention Weights - Step {step}, Layer {layer}")
+            if query_phi_ascending:
+                ax.invert_yaxis()
 
-        x_arrow = "→" if key_phi_ascending else "←"
-        y_arrow = "↑" if query_phi_ascending else "↓"
-        ax.set_xlabel(f"Keys ({x_arrow} increasing φ)")
-        ax.set_ylabel(f"Queries ({y_arrow} increasing φ)")
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label("Attention Weight", rotation=270, labelpad=15)
 
-        if key_phi is not None and key_phi.numel() == weights.shape[1]:
-            tick_idx = np.linspace(0, weights.shape[1] - 1, num=min(6, weights.shape[1]), dtype=int)
-            ax.set_xticks(tick_idx)
-            xticklabels = [f"{key_phi[idx].item():.2f}" for idx in tick_idx]
-            ax.set_xticklabels(xticklabels, rotation=45, ha="right")
-        if query_phi is not None and query_phi.numel() == weights.shape[0]:
-            tick_idy = np.linspace(0, weights.shape[0] - 1, num=min(6, weights.shape[0]), dtype=int)
-            ax.set_yticks(tick_idy)
-            yticklabels = [f"{query_phi[idx].item():.2f}" for idx in tick_idy]
-            ax.set_yticklabels(yticklabels)
+            ax.set_title(f"Attention Weights - Step {step}, Layer {layer}")
 
-        logger = getattr(pl_module, "logger", None)
-        print(f"[ATTN_WEIGHTS] Logger exists: {logger is not None}, has experiment: {hasattr(logger, 'experiment') if logger else False}")
-        if logger is not None and hasattr(logger, "experiment"):
-            figure_name = f"{prefix}_step{step}_layer{layer}"
-            print(f"[ATTN_WEIGHTS] Calling log_figure with name: {figure_name}")
-            logger.experiment.log_figure(figure_name=figure_name, figure=fig, step=step)
-            print(f"[ATTN_WEIGHTS] log_figure completed successfully")
-        else:
-            print(f"[ATTN_WEIGHTS] WARNING: No logger available!")
-        plt.close(fig)
+            x_arrow = "→" if key_phi_ascending else "←"
+            y_arrow = "↑" if query_phi_ascending else "↓"
+            ax.set_xlabel(f"Keys ({x_arrow} increasing φ)")
+            ax.set_ylabel(f"Queries ({y_arrow} increasing φ)")
+
+            if key_phi_1d is not None and key_phi_1d.numel() == weights_2d.shape[1]:
+                tick_idx = np.linspace(0, weights_2d.shape[1] - 1, num=min(6, weights_2d.shape[1]), dtype=int)
+                ax.set_xticks(tick_idx)
+                xticklabels = [f"{key_phi_1d[idx].item():.2f}" for idx in tick_idx]
+                ax.set_xticklabels(xticklabels, rotation=45, ha="right")
+            if query_phi_1d is not None and query_phi_1d.numel() == weights_2d.shape[0]:
+                tick_idy = np.linspace(0, weights_2d.shape[0] - 1, num=min(6, weights_2d.shape[0]), dtype=int)
+                ax.set_yticks(tick_idy)
+                yticklabels = [f"{query_phi_1d[idx].item():.2f}" for idx in tick_idy]
+                ax.set_yticklabels(yticklabels)
+
+            logger = getattr(pl_module, "logger", None)
+            print(f"[ATTN_WEIGHTS] Logger exists: {logger is not None}, has experiment: {hasattr(logger, 'experiment') if logger else False}")
+            if logger is not None and hasattr(logger, "experiment"):
+                figure_name = f"{prefix}_step{step}_layer{layer}"
+                print(f"[ATTN_WEIGHTS] Calling log_figure with name: {figure_name}")
+                logger.experiment.log_figure(figure_name=figure_name, figure=fig, step=step)
+                print(f"[ATTN_WEIGHTS] log_figure completed successfully")
+            else:
+                print(f"[ATTN_WEIGHTS] WARNING: No logger available!")
+        except Exception as e:
+            print(f"[ATTN_WEIGHTS] ERROR: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            if fig is not None:
+                plt.close(fig)
 
     def _log_attention_stats(self, pl_module, mask, step, layer, prefix="val"):
         """Log basic attention mask statistics."""
@@ -650,15 +702,20 @@ class AttnMaskLogger(Callback):
 
                 if self.log_all_layers or layer_index == max(layer_indices):
                     attn_mask = l_out.get("attn_mask")
-                    attn_mask_im = attn_mask[0].detach().cpu().clone().int() if attn_mask is not None else None
-                    query_sample = query_phi[0].detach().cpu() if query_phi is not None else None
-                    key_sample = key_phi[0].detach().cpu() if key_phi is not None else None
+                    # Use helper functions to handle dimension variations
+                    attn_mask_im = self._ensure_2d_cpu(attn_mask).clone().int() if attn_mask is not None else None
+                    query_sample = self._ensure_1d_cpu(query_phi)
+                    key_sample = self._ensure_1d_cpu(key_phi)
                     query_mask_sample = None
                     if query_mask is not None:
-                        query_mask_sample = query_mask[0].detach().cpu().bool()
+                        query_mask_sample = self._ensure_1d_cpu(query_mask)
+                        if query_mask_sample is not None:
+                            query_mask_sample = query_mask_sample.bool()
                     invalid_mask_sample = None
                     if invalid_mask is not None:
-                        invalid_mask_sample = invalid_mask[0].detach().cpu().bool()
+                        invalid_mask_sample = self._ensure_1d_cpu(invalid_mask)
+                        if invalid_mask_sample is not None:
+                            invalid_mask_sample = invalid_mask_sample.bool()
                     elif query_mask_sample is not None:
                         invalid_mask_sample = ~query_mask_sample
                     if attn_mask_im is not None:
@@ -676,7 +733,7 @@ class AttnMaskLogger(Callback):
                     if self.log_kv_mask:
                         kv_mask = l_out.get("attn_mask_kv")
                         if kv_mask is not None:
-                            kv_im = kv_mask[0].detach().cpu().clone().int()
+                            kv_im = self._ensure_2d_cpu(kv_mask).clone().int()
                             self._log_attention_mask(
                                 pl_module,
                                 kv_im,
@@ -687,7 +744,7 @@ class AttnMaskLogger(Callback):
                                 key_phi=query_sample,
                             )
                     if self.log_lca_mask and lca_mask is not None:
-                        lca_im = lca_mask[0].detach().cpu().clone().int()
+                        lca_im = self._ensure_2d_cpu(lca_mask).clone().int()
                         self._log_attention_mask(
                             pl_module,
                             lca_im,
@@ -700,7 +757,7 @@ class AttnMaskLogger(Callback):
                             invalid_mask=invalid_mask_sample,
                         )
                     if self.log_task_mask and task_mask is not None:
-                        task_im = task_mask[0].detach().cpu().clone().int()
+                        task_im = self._ensure_2d_cpu(task_mask).clone().int()
                         self._log_attention_mask(
                             pl_module,
                             task_im,
@@ -720,7 +777,7 @@ class AttnMaskLogger(Callback):
                                 if diag_key.startswith(f"{diag_stage}_"):
                                     diag_mask = l_out[diag_key]
                                     if diag_mask is not None and torch.is_tensor(diag_mask):
-                                        diag_im = diag_mask[0].detach().cpu().clone().int()
+                                        diag_im = self._ensure_2d_cpu(diag_mask).clone().int()
                                         self._log_attention_mask(
                                             pl_module,
                                             diag_im,
@@ -738,10 +795,19 @@ class AttnMaskLogger(Callback):
                         fwd_attn_weights = l_out.get("fwd_ca_attn_weights")
                         print(f"[CALLBACK] Layer {layer_index}: fwd_ca_attn_weights exists={fwd_attn_weights is not None}")
                         if fwd_attn_weights is not None:
-                            print(f"[CALLBACK] Layer {layer_index}: LOGGING fwd_ca_attn_weights to Comet as 'fwd_ca_attn_weights_{prefix_suffix}_step{step}_layer{layer_index}'")
+                            print(
+                                f"[CALLBACK] Layer {layer_index}: LOGGING fwd_ca_attn_weights to Comet as 'fwd_ca_attn_weights_{prefix_suffix}_step{step}_layer{layer_index}'"
+                            )
+                            # Ensure weights are 2D (Q, K) - handle both with and without batch dim
+                            weights = fwd_attn_weights.detach()
+                            if weights.dim() == 3 and weights.shape[0] == 1:
+                                weights = weights.squeeze(0)
+                            elif weights.dim() > 2:
+                                weights = weights[0]  # Take first batch if B > 1
+                            weights_2d = weights.cpu() if weights.is_cuda else weights
                             self._log_attention_weights(
                                 pl_module,
-                                fwd_attn_weights[0].detach().cpu(),
+                                weights_2d,
                                 step,
                                 layer_index,
                                 f"fwd_ca_attn_weights_{prefix_suffix}",
@@ -752,9 +818,16 @@ class AttnMaskLogger(Callback):
                         bidi_attn_weights = l_out.get("bidi_ca_attn_weights")
                         if bidi_attn_weights is not None:
                             # Note: for bidi CA, rows are keys, cols are queries
+                            # Ensure weights are 2D (K, Q) - handle both with and without batch dim
+                            weights = bidi_attn_weights.detach()
+                            if weights.dim() == 3 and weights.shape[0] == 1:
+                                weights = weights.squeeze(0)
+                            elif weights.dim() > 2:
+                                weights = weights[0]  # Take first batch if B > 1
+                            weights_2d = weights.cpu() if weights.is_cuda else weights
                             self._log_attention_weights(
                                 pl_module,
-                                bidi_attn_weights[0].detach().cpu(),
+                                weights_2d,
                                 step,
                                 layer_index,
                                 f"bidi_ca_attn_weights_{prefix_suffix}",
@@ -876,17 +949,17 @@ class AttnMaskLogger(Callback):
         if batch_idx % self.log_every_n_batches != 0:
             return
         step = getattr(trainer, "global_step", batch_idx)
-        
+
         # If outputs is None (e.g., MTL mode), try to get stored outputs from pl_module
         if outputs is None or not isinstance(outputs, dict):
             outputs = getattr(pl_module, "_last_outputs", None)
             if outputs is not None:
                 print(f"[CALLBACK] batch_idx={batch_idx}: Using _last_outputs from pl_module")
-        
+
         if outputs is None:
             print(f"[CALLBACK] batch_idx={batch_idx}: No outputs available, skipping")
             return
-        
+
         # For attention weights, use diagnostic outputs which are stored separately
         # and not overwritten by non-diagnostic batches
         diagnostic_outputs = getattr(pl_module, "_diagnostic_outputs", None)
@@ -901,7 +974,7 @@ class AttnMaskLogger(Callback):
                             outputs[layer_key][weight_key] = diagnostic_outputs[layer_key][weight_key]
             # Clear diagnostic outputs after using them to avoid re-logging
             pl_module._diagnostic_outputs = None
-        
+
         self._process_attention_masks_from_outputs(pl_module, outputs, step, is_validation=False)
 
     def _log_mask_points_for_kde(self, pl_module, mask, step, layer, prefix="local_ma_mask"):
