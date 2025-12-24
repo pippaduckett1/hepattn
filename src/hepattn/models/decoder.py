@@ -620,22 +620,14 @@ class MaskFormerDecoder(nn.Module):
                 )
                 q_after_ca = decoder_layer.q_dense(q_after_ca)
 
-                # Log forward CA attention weights
+                # Log forward CA attention weights (single head, already on CPU)
                 print(f"[DIAGNOSTIC] Layer {layer_index}: Checking for fwd CA weights, exists={decoder_layer.q_ca.fn.last_attn_weights is not None}")
                 if decoder_layer.q_ca.fn.last_attn_weights is not None:
-                    # Average over heads for visualization: (B, H, Q, K) -> (B, Q, K) or (H, Q, K) -> (Q, K)
+                    # Shape is (B, Q, K) for single head - squeeze batch if B=1
                     raw_weights = decoder_layer.q_ca.fn.last_attn_weights
-                    # Handle both cases: with batch dim (B, H, Q, K) and without (H, Q, K)
-                    if raw_weights.dim() == 4:
-                        # (B, H, Q, K) -> (B, Q, K) -> (Q, K) if B=1
-                        fwd_attn_weights = raw_weights.mean(dim=1)
-                        if fwd_attn_weights.shape[0] == 1:
-                            fwd_attn_weights = fwd_attn_weights.squeeze(0)
-                    elif raw_weights.dim() == 3:
-                        # (H, Q, K) -> (Q, K)
-                        fwd_attn_weights = raw_weights.mean(dim=0)
+                    if raw_weights.dim() == 3 and raw_weights.shape[0] == 1:
+                        fwd_attn_weights = raw_weights.squeeze(0)  # (Q, K)
                     else:
-                        # Already 2D (Q, K)
                         fwd_attn_weights = raw_weights
                     outputs[f"layer_{layer_index}"]["fwd_ca_attn_weights"] = fwd_attn_weights
                     print(f"[DIAGNOSTIC] Layer {layer_index}: Stored fwd_ca_attn_weights with shape {fwd_attn_weights.shape}")
@@ -695,24 +687,16 @@ class MaskFormerDecoder(nn.Module):
                     )
                     kv_after_bidi = decoder_layer.kv_dense(kv_after_bidi)
 
-                    # Log bidirectional CA attention weights
+                    # Log bidirectional CA attention weights (single head, already on CPU)
                     print(
                         f"[DIAGNOSTIC] Layer {layer_index}: Checking for bidi CA weights, exists={decoder_layer.kv_ca.fn.last_attn_weights is not None}"
                     )
                     if decoder_layer.kv_ca.fn.last_attn_weights is not None:
-                        # Average over heads for visualization: (B, H, K, Q) -> (B, K, Q) or (H, K, Q) -> (K, Q)
+                        # Shape is (B, K, Q) for single head - squeeze batch if B=1
                         raw_weights = decoder_layer.kv_ca.fn.last_attn_weights
-                        # Handle both cases: with batch dim (B, H, K, Q) and without (H, K, Q)
-                        if raw_weights.dim() == 4:
-                            # (B, H, K, Q) -> (B, K, Q) -> (K, Q) if B=1
-                            bidi_attn_weights = raw_weights.mean(dim=1)
-                            if bidi_attn_weights.shape[0] == 1:
-                                bidi_attn_weights = bidi_attn_weights.squeeze(0)
-                        elif raw_weights.dim() == 3:
-                            # (H, K, Q) -> (K, Q)
-                            bidi_attn_weights = raw_weights.mean(dim=0)
+                        if raw_weights.dim() == 3 and raw_weights.shape[0] == 1:
+                            bidi_attn_weights = raw_weights.squeeze(0)  # (K, Q)
                         else:
-                            # Already 2D (K, Q)
                             bidi_attn_weights = raw_weights
                         outputs[f"layer_{layer_index}"]["bidi_ca_attn_weights"] = bidi_attn_weights
                         print(f"[DIAGNOSTIC] Layer {layer_index}: Stored bidi_ca_attn_weights with shape {bidi_attn_weights.shape}")

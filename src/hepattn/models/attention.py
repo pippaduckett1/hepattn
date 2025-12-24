@@ -243,31 +243,47 @@ class Attention(nn.Module):
             x = x.transpose(-3, -2)  # B H S Dh -> B S H Dh
         return x.flatten(-2)  # B S H Dh -> B S D
 
-    def _compute_attn_weights(self, q: Tensor, k: Tensor, attn_mask: Tensor | None) -> Tensor:
-        """Compute attention weights for diagnostic logging.
+    def _compute_attn_weights(self, q: Tensor, k: Tensor, attn_mask: Tensor | None, head_idx: int = 0) -> Tensor:
+        """Compute attention weights for diagnostic logging (memory-efficient version).
+
+        Only computes for a single head to reduce memory by ~8x.
+        Uses no_grad() and preserves input dtype to avoid fp32 upcasting.
 
         Args:
             q: Query tensor of shape (B, H, N, Dh).
             k: Key tensor of shape (B, H, M, Dh).
             attn_mask: Optional attention mask/bias of shape (B, H, N, M) or (B, 1, N, M).
+            head_idx: Which head to compute weights for (default 0).
 
         Returns:
-            Attention weights of shape (B, H, N, M) after softmax, moved to CPU to save GPU memory.
+            Attention weights of shape (B, N, M) for the selected head, moved to CPU.
         """
-        scale = q.shape[-1] ** -0.5
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, N, M)
+        with torch.no_grad():
+            # Only compute for one head to save memory (8x reduction)
+            q_head = q[:, head_idx : head_idx + 1, :, :]  # (B, 1, N, Dh)
+            k_head = k[:, head_idx : head_idx + 1, :, :]  # (B, 1, M, Dh)
 
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                # Boolean mask: True = attend, False = mask out
-                attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
-            else:
-                # Float mask/bias: add directly (already has -inf for masked positions)
-                attn_scores = attn_scores + attn_mask
+            scale = q.shape[-1] ** -0.5
+            # Keep in input dtype (bf16) to avoid fp32 upcasting
+            attn_scores = torch.matmul(q_head, k_head.transpose(-2, -1)) * scale  # (B, 1, N, M)
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        # Move to CPU immediately to avoid GPU memory buildup
-        return attn_weights.detach().cpu()
+            if attn_mask is not None:
+                # Handle mask that might be (B, H, N, M) or (B, 1, N, M)
+                if attn_mask.dim() == 4 and attn_mask.shape[1] > 1:
+                    mask_head = attn_mask[:, head_idx : head_idx + 1, :, :]
+                else:
+                    mask_head = attn_mask
+
+                if mask_head.dtype == torch.bool:
+                    attn_scores = attn_scores.masked_fill(~mask_head, float("-inf"))
+                else:
+                    attn_scores = attn_scores + mask_head
+
+            # Compute softmax in fp32 for numerical stability, then convert back
+            attn_weights = F.softmax(attn_scores.float(), dim=-1).to(q.dtype)
+
+            # Remove the head dimension and move to CPU
+            return attn_weights.squeeze(1).cpu()  # (B, N, M)
 
     def _prepare_qkv(
         self,
