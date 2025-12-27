@@ -79,6 +79,9 @@ class MaskFormerDecoder(nn.Module):
         bidirectional_ca_soft_narrowing: bool = False,
         bidirectional_ca_narrowing_tau: float = 0.1,
         bidirectional_ca_local_window_scale: float = 0.25,
+        bidirectional_ca_skip_first_layer: bool = False,
+        bidirectional_ca_last_layer_only: bool = False,
+        bidirectional_ca_use_q_before_sa: bool = False,
         dynamic_queries: bool = False,
         log_diagnostic_task_masks: bool = False,
         diagnostic_log_interval: int = 1000,
@@ -104,6 +107,7 @@ class MaskFormerDecoder(nn.Module):
         super().__init__()
 
         self.decoder_layers = nn.ModuleList([MaskFormerDecoderLayer(depth=i, **decoder_layer_config) for i in range(num_decoder_layers)])
+        self.num_decoder_layers = num_decoder_layers
         self.dim = decoder_layer_config["dim"]
         self.bidirectional_ca = decoder_layer_config.get("bidirectional_ca", True)
         self.tasks: list | None = None  # Will be set by MaskFormer
@@ -232,6 +236,9 @@ class MaskFormerDecoder(nn.Module):
         # Bidirectional CA control parameters
         self.phi_aware_transpose = phi_aware_transpose
         self.bidirectional_ca_use_key_values = bidirectional_ca_use_key_values
+        self.bidirectional_ca_use_q_before_sa = bidirectional_ca_use_q_before_sa
+        self.bidirectional_ca_skip_first_layer = bidirectional_ca_skip_first_layer
+        self.bidirectional_ca_last_layer_only = bidirectional_ca_last_layer_only
         if bidirectional_ca_start_layer is not None:
             self.bidirectional_ca_start_layer = int(bidirectional_ca_start_layer)
         else:
@@ -597,6 +604,10 @@ class MaskFormerDecoder(nn.Module):
 
             # Determine per-layer bidirectional CA control
             layer_use_bidirectional = layer_index >= self.bidirectional_ca_start_layer
+            if self.bidirectional_ca_skip_first_layer:
+                layer_use_bidirectional = layer_use_bidirectional and layer_index > 0
+            if self.bidirectional_ca_last_layer_only:
+                layer_use_bidirectional = layer_index == (self.num_decoder_layers - 1)
 
             # Update the keys and queries
             q_mask = x.get("query_mask") if apply_query_masks else None
@@ -673,9 +684,10 @@ class MaskFormerDecoder(nn.Module):
                         if layer_attn_bias_transpose is not None
                         else (layer_attn_bias.transpose(-2, -1) if layer_attn_bias is not None else None)
                     )
-                    q_pe_bidi = q_after_sa if query_posenc is None else q_after_sa + decoder_layer.scale_pe * query_posenc
+                    q_for_bidi = q_after_ca if self.bidirectional_ca_use_q_before_sa else q_after_sa
+                    q_pe_bidi = q_for_bidi if query_posenc is None else q_for_bidi + decoder_layer.scale_pe * query_posenc
                     kv_pe_bidi = x["key_embed"] if key_posenc is None else x["key_embed"] + decoder_layer.scale_pe * key_posenc
-                    v_for_bidi = x["key_embed"] if self.bidirectional_ca_use_key_values else q_after_sa
+                    v_for_bidi = x["key_embed"] if self.bidirectional_ca_use_key_values else q_for_bidi
                     kv_after_bidi = decoder_layer.kv_ca(
                         kv_pe_bidi,
                         k=q_pe_bidi,
@@ -736,6 +748,7 @@ class MaskFormerDecoder(nn.Module):
                     attn_bias_transpose=layer_attn_bias_transpose,
                     use_bidirectional_ca=layer_use_bidirectional,
                     use_key_values=self.bidirectional_ca_use_key_values,
+                    use_q_before_sa=self.bidirectional_ca_use_q_before_sa,
                 )
 
             if kv_attn_mask_for_logging is not None:
@@ -1542,6 +1555,7 @@ class MaskFormerDecoderLayer(nn.Module):
         attn_bias_transpose: Tensor | None = None,
         use_bidirectional_ca: bool | None = None,
         use_key_values: bool = False,
+        use_q_before_sa: bool = False,
     ) -> tuple[Tensor, Tensor]:
         """Forward pass for the decoder layer.
 
@@ -1596,11 +1610,12 @@ class MaskFormerDecoderLayer(nn.Module):
                 else:
                     attn_bias = attn_bias.transpose(-2, -1)
 
-            q_pe = q if query_posenc is None else q + self.scale_pe * query_posenc
+            q_for_bidi = q_before_sa if use_q_before_sa else q
+            q_pe = q_for_bidi if query_posenc is None else q_for_bidi + self.scale_pe * query_posenc
             kv_pe = kv if key_posenc is None else kv + self.scale_pe * key_posenc
 
             # Choose value source: key embeddings (use_key_values=True) or query embeddings (default)
-            v_for_bidi = kv if use_key_values else q
+            v_for_bidi = kv if use_key_values else q_for_bidi
 
             kv = self.kv_ca(kv_pe, k=q_pe, v=v_for_bidi, attn_mask=attn_mask, attn_bias=attn_bias, q_mask=kv_mask, kv_mask=q_mask)
             kv = self.kv_dense(kv)

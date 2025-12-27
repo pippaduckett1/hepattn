@@ -191,11 +191,13 @@ class AttnMaskLogger(Callback):
         try:
             print(f"[ATTN_WEIGHTS] Creating figure for {prefix}_step{step}_layer{layer}, weights shape: {weights.shape}")
 
-            # Ensure weights are 2D and on CPU
+            # Ensure weights are 2D and on CPU, convert to float32 for numpy compatibility
             weights_2d = self._ensure_2d_cpu(weights)
+            if weights_2d.dtype == torch.bfloat16:
+                weights_2d = weights_2d.float()  # Convert bf16 -> fp32 for numpy
             query_phi_1d = self._ensure_1d_cpu(query_phi)
             key_phi_1d = self._ensure_1d_cpu(key_phi)
-
+            
             fig, ax = plt.subplots(constrained_layout=True, dpi=300)
 
             # Use a continuous colormap for weights
