@@ -1171,6 +1171,18 @@ class MaskFormerDecoder(nn.Module):
         Returns:
             Mask of shape (B, K, Q) where mask[b, k, q] = 1 if |φ_k - φ_q| < threshold.
         """
+        # Apply optional q-shift in angular space so backward masks respect the same offset as forward masks
+        # Shift is applied only to queries (consistent with forward LCA behavior)
+        shift = None
+        if self.lca_shift_absolute is not None:
+            shift = (self.lca_shift_absolute / key_phi.shape[-1]) * 2 * torch.pi
+        elif self.lca_shift_fractional is not None:
+            shift = self.lca_shift_fractional * 2 * torch.pi
+        elif self.lca_shift_queries is not None:
+            shift = (self.lca_shift_queries / query_phi.shape[-1]) * 2 * torch.pi
+        if shift is not None:
+            query_phi = query_phi + shift
+
         # Compute wrapped phi difference: key_phi[b, k] - query_phi[b, q]
         phi_diff = key_phi.unsqueeze(-1) - query_phi.unsqueeze(-2)  # (B, K, Q)
         phi_diff = (phi_diff + torch.pi) % (2 * torch.pi) - torch.pi  # wrap to [-π, π]
@@ -1188,6 +1200,10 @@ class MaskFormerDecoder(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         window_scale: float | None = None,
+        shift_absolute: int | None = None,
+        shift_fractional: float | None = None,
+        shift_queries: int | None = None,
+        wrap: bool = True,
     ) -> torch.Tensor:
         """Compute a K×Q local attention mask for bidirectional CA.
 
@@ -1221,13 +1237,34 @@ class MaskFormerDecoder(nn.Module):
 
         # Index fractions for keys and queries
         k_fractions = torch.arange(k_len, device=device, dtype=dtype) / k_len
-        q_fractions = torch.arange(q_len, device=device, dtype=dtype) / q_len
+        q_indices = torch.arange(q_len, device=device, dtype=dtype)
+
+        # Apply optional shift to query indices so backward local masks align with forward q-shift
+        shift_count = sum(x is not None for x in [shift_absolute, shift_fractional, shift_queries])
+        if shift_count > 1:
+            raise ValueError("Only one of shift_absolute, shift_fractional, or shift_queries can be set")
+        shift_q = 0.0
+        if shift_absolute is not None:
+            shift_q = float(shift_absolute) * (q_len / k_len)
+        elif shift_fractional is not None:
+            shift_q = float(shift_fractional) * q_len
+        elif shift_queries is not None:
+            shift_q = float(shift_queries)
+
+        if shift_q != 0:
+            # roll with wrap; if no wrap, just shift and rely on distance calculation
+            if wrap:
+                q_indices = (q_indices + shift_q) % q_len
+            else:
+                q_indices = q_indices + shift_q
+
+        q_fractions = q_indices / q_len
 
         # Distance in fraction space: |k/K - q/Q|
         dist = torch.abs(k_fractions.unsqueeze(-1) - q_fractions.unsqueeze(-2))  # (K, Q)
 
         # Handle wrapping if enabled (for cyclic φ coordinates)
-        if self.window_wrap:
+        if wrap:
             dist = torch.minimum(dist, 1.0 - dist)
 
         # Create mask: allow attention within half-window on each side
@@ -1322,6 +1359,10 @@ class MaskFormerDecoder(nn.Module):
                 k_len=K,
                 device=mask.device,
                 dtype=torch.float32,
+                shift_absolute=self.lca_shift_absolute,
+                shift_fractional=self.lca_shift_fractional,
+                shift_queries=self.lca_shift_queries,
+                wrap=self.window_wrap,
             )
             # Expand to batch size
             B = mask.shape[0]
