@@ -45,6 +45,7 @@ class MaskFormerDecoder(nn.Module):
         mask_attention_num_layers: int | None = None,
         mask_attention_start_layer: int | None = None,
         every_other_layer: bool = False,
+        mask_attention_second_and_third_only: bool = False,
         local_strided_skip_first_layer: bool = False,
         local_strided_start_layer: int | None = None,
         local_strided_first_layer_only: bool = False,
@@ -134,9 +135,15 @@ class MaskFormerDecoder(nn.Module):
         self.use_first_layer_mask_only = use_first_layer_mask_only
         self.mask_attention_first_layer_only = mask_attention_first_layer_only
         self.mask_attention_num_layers = int(mask_attention_num_layers) if mask_attention_num_layers is not None else None
+        self.mask_attention_second_and_third_only = mask_attention_second_and_third_only
         if self.mask_attention_num_layers is not None:
             assert self.mask_attention_num_layers > 0, "mask_attention_num_layers must be positive"
-        self.mask_attention_start_layer = int(mask_attention_start_layer) if mask_attention_start_layer is not None else 0
+        if self.mask_attention_second_and_third_only:
+            # force mask attention only on layers 1 and 2 (zero-indexed)
+            self.mask_attention_start_layer = 1
+            self.mask_attention_num_layers = 2
+        else:
+            self.mask_attention_start_layer = int(mask_attention_start_layer) if mask_attention_start_layer is not None else 0
         assert self.mask_attention_start_layer >= 0, "mask_attention_start_layer must be non-negative"
         self.no_if_none_then_all = no_if_none_then_all
         self.every_other_layer = every_other_layer
