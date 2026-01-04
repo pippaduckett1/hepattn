@@ -42,6 +42,7 @@ class MaskFormerDecoder(nn.Module):
         change_if_none_then_all: bool = False,
         use_first_layer_mask_only: bool = False,
         mask_attention_first_layer_only: bool = False,
+        mask_attention_last_layer_only: bool = False,
         mask_attention_num_layers: int | None = None,
         mask_attention_start_layer: int | None = None,
         every_other_layer: bool = False,
@@ -134,6 +135,7 @@ class MaskFormerDecoder(nn.Module):
         self.change_if_none_then_all = change_if_none_then_all
         self.use_first_layer_mask_only = use_first_layer_mask_only
         self.mask_attention_first_layer_only = mask_attention_first_layer_only
+        self.mask_attention_last_layer_only = mask_attention_last_layer_only
         self.mask_attention_num_layers = int(mask_attention_num_layers) if mask_attention_num_layers is not None else None
         self.mask_attention_second_and_third_only = mask_attention_second_and_third_only
         if self.mask_attention_num_layers is not None:
@@ -386,6 +388,8 @@ class MaskFormerDecoder(nn.Module):
                 layer_uses_mask_attention = False
             elif self.mask_attention_first_layer_only:
                 layer_uses_mask_attention = layer_index == 0
+            elif self.mask_attention_last_layer_only:
+                layer_uses_mask_attention = layer_index == (self.num_decoder_layers - 1)
             elif self.mask_attention_num_layers is not None:
                 layer_uses_mask_attention = layer_index < self.mask_attention_num_layers
             else:
