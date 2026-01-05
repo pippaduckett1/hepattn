@@ -93,6 +93,8 @@ class MaskFormerDecoder(nn.Module):
         bidi_mask_similarity_weight: float = 0.0,
         mask_outside_penalty_weight: float = 0.0,
         mask_outside_penalty_source: str = "lca",
+        mask_attention_bias_scale: float = 0.0,
+        mask_attention_bias_use_logits: bool = True,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -306,6 +308,8 @@ class MaskFormerDecoder(nn.Module):
         self.bidi_mask_similarity_weight = float(bidi_mask_similarity_weight)
         self.mask_outside_penalty_weight = float(mask_outside_penalty_weight)
         self.mask_outside_penalty_source = mask_outside_penalty_source
+        self.mask_attention_bias_scale = float(mask_attention_bias_scale)
+        self.mask_attention_bias_use_logits = bool(mask_attention_bias_use_logits)
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
@@ -427,6 +431,7 @@ class MaskFormerDecoder(nn.Module):
             collect_task_masks = compute_attn_mask and (layer_uses_mask_attention or layer_uses_local_strided or layer_uses_phi_distance_mask)
 
             attn_masks: dict[str, torch.Tensor] = {}
+            attn_biases: dict[str, torch.Tensor] = {}
             use_task_masks = collect_task_masks
             query_mask = None
             layer_attn_mask: torch.Tensor | None = None
@@ -459,6 +464,11 @@ class MaskFormerDecoder(nn.Module):
                             attn_masks[input_name] |= task_attn_mask
                         else:
                             attn_masks[input_name] = task_attn_mask
+                        # Collect logits for biasing attention if enabled
+                        if self.mask_attention_bias_scale > 0 and hasattr(task, "output_object_hit"):
+                            logit_key = task.output_object_hit + "_logit"
+                            if logit_key in task_outputs:
+                                attn_biases[input_name] = task_outputs[logit_key].detach()
 
                 if isinstance(task, ObjectClassificationTask):
                     task_query_mask = task.query_mask(task_outputs)
@@ -476,6 +486,7 @@ class MaskFormerDecoder(nn.Module):
                 outputs[f"layer_{layer_index}"]["query_mask"] = query_mask.detach().clone()
 
             task_attn_mask: torch.Tensor | None = None
+            task_attn_bias: torch.Tensor | None = None
             if attn_masks:
                 if self.unified_decoding:
                     if len(attn_masks) > 1:
@@ -483,12 +494,20 @@ class MaskFormerDecoder(nn.Module):
                     task_attn_mask = next(iter(attn_masks.values()))
                     if task_attn_mask.dim() == 2:
                         task_attn_mask = task_attn_mask.unsqueeze(-1).expand(-1, -1, num_constituents)
+                    if attn_biases:
+                        task_attn_bias = next(iter(attn_biases.values()))
+                        if task_attn_bias.dim() == 2:
+                            task_attn_bias = task_attn_bias.unsqueeze(-1).expand(-1, -1, num_constituents)
                 else:
                     num_queries_actual = x["query_embed"].shape[1]
                     task_attn_mask = torch.full((batch_size, num_queries_actual, num_constituents), False, device=x["key_embed"].device)
+                    task_attn_bias = torch.zeros((batch_size, num_queries_actual, num_constituents), device=x["key_embed"].device)
                     for input_name, mask in attn_masks.items():
                         task_mask = mask.flatten()
                         task_attn_mask[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_mask)] = task_mask
+                    for input_name, bias in attn_biases.items():
+                        task_bias = bias.flatten()
+                        task_attn_bias[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_bias)] = task_bias
 
                 task_attn_mask = task_attn_mask.detach()
                 outputs[f"layer_{layer_index}"]["task_attn_mask"] = task_attn_mask.clone()
@@ -504,6 +523,18 @@ class MaskFormerDecoder(nn.Module):
                             torch.all(~task_attn_mask_for_layer, dim=-1, keepdim=True), True, task_attn_mask_for_layer
                         )
                     layer_attn_mask = task_attn_mask_for_layer
+
+                # Apply mask-derived bias without hard masking, if configured
+                if self.mask_attention_bias_scale > 0:
+                    bias_source = None
+                    if self.mask_attention_bias_use_logits and task_attn_bias is not None:
+                        bias_source = task_attn_bias.detach()
+                    elif not self.mask_attention_bias_use_logits and task_attn_mask is not None:
+                        bias_source = task_attn_mask.float() - 0.5
+                    if bias_source is not None:
+                        bias_source = bias_source.to(x["key_embed"].dtype)
+                        bias = self.mask_attention_bias_scale * bias_source
+                        layer_attn_bias = bias if layer_attn_bias is None else layer_attn_bias + bias
 
             if self.use_phi_distance_mask:
                 layer_attn_mask = self.compute_phi_distance_mask(x)
