@@ -88,6 +88,11 @@ class MaskFormerDecoder(nn.Module):
         dynamic_queries: bool = False,
         log_diagnostic_task_masks: bool = False,
         diagnostic_log_interval: int = 1000,
+        mask_consistency_weight: float = 0.0,
+        mask_consistency_source: str = "lca",
+        bidi_mask_similarity_weight: float = 0.0,
+        mask_outside_penalty_weight: float = 0.0,
+        mask_outside_penalty_source: str = "lca",
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -296,6 +301,11 @@ class MaskFormerDecoder(nn.Module):
         self.log_diagnostic_task_masks = log_diagnostic_task_masks
         self.diagnostic_log_interval = int(diagnostic_log_interval)
         self._forward_count = 0  # Counter for controlling diagnostic logging frequency
+        self.mask_consistency_weight = float(mask_consistency_weight)
+        self.mask_consistency_source = mask_consistency_source
+        self.bidi_mask_similarity_weight = float(bidi_mask_similarity_weight)
+        self.mask_outside_penalty_weight = float(mask_outside_penalty_weight)
+        self.mask_outside_penalty_source = mask_outside_penalty_source
 
     def forward(self, x: dict[str, Tensor], input_names: list[str]) -> tuple[dict[str, Tensor], dict[str, dict]]:
         """Forward pass through decoder layers.
