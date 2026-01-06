@@ -86,7 +86,15 @@ class AttnMaskLogger(Callback):
 
             fig, ax = plt.subplots(constrained_layout=True, dpi=300)
             cmap = ListedColormap(["#002b7f", "#ffff33"])  # blue for 0, yellow for 1
-            im = ax.imshow(mask_2d.numpy().astype(int), aspect="auto", cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
+            im = ax.imshow(
+                mask_2d.numpy().astype(int),
+                aspect="auto",
+                cmap=cmap,
+                vmin=0,
+                vmax=1,
+                interpolation="nearest",
+                origin="lower",
+            )
 
             # Determine if phi is ascending or descending with index
             query_phi_ascending = True
@@ -197,11 +205,18 @@ class AttnMaskLogger(Callback):
                 weights_2d = weights_2d.float()  # Convert bf16 -> fp32 for numpy
             query_phi_1d = self._ensure_1d_cpu(query_phi)
             key_phi_1d = self._ensure_1d_cpu(key_phi)
-            
+
             fig, ax = plt.subplots(constrained_layout=True, dpi=300)
 
             # Use a continuous colormap for weights
-            im = ax.imshow(weights_2d.numpy(), aspect="auto", cmap="viridis", vmin=0, interpolation="nearest")
+            im = ax.imshow(
+                weights_2d.numpy(),
+                aspect="auto",
+                cmap="viridis",
+                vmin=0,
+                interpolation="nearest",
+                origin="lower",
+            )
             print(f"[ATTN_WEIGHTS] imshow complete")
 
             # Determine phi ordering for axis inversion
