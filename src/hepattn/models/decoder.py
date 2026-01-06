@@ -501,12 +501,16 @@ class MaskFormerDecoder(nn.Module):
                 else:
                     num_queries_actual = x["query_embed"].shape[1]
                     task_attn_mask = torch.full((batch_size, num_queries_actual, num_constituents), False, device=x["key_embed"].device)
-                    task_attn_bias = torch.zeros((batch_size, num_queries_actual, num_constituents), device=x["key_embed"].device)
+                    task_attn_bias = torch.zeros(
+                        (batch_size, num_queries_actual, num_constituents),
+                        device=x["key_embed"].device,
+                        dtype=x["key_embed"].dtype,
+                    )
                     for input_name, mask in attn_masks.items():
                         task_mask = mask.flatten()
                         task_attn_mask[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_mask)] = task_mask
                     for input_name, bias in attn_biases.items():
-                        task_bias = bias.flatten()
+                        task_bias = bias.flatten().to(task_attn_bias.dtype)
                         task_attn_bias[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_bias)] = task_bias
 
                 task_attn_mask = task_attn_mask.detach()
