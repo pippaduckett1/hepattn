@@ -95,6 +95,8 @@ class MaskFormerDecoder(nn.Module):
         mask_outside_penalty_source: str = "lca",
         mask_attention_bias_scale: float = 0.0,
         mask_attention_bias_use_logits: bool = True,
+        curriculum_lca: dict | None = None,
+        query_modulation: dict | None = None,
     ):
         """MaskFormer decoder that handles multiple decoder layers and task integration.
 
@@ -190,6 +192,31 @@ class MaskFormerDecoder(nn.Module):
             raise ValueError("quantile_query_phi and histogram_query_phi cannot both be True")
         if self.histogram_query_phi:
             assert self.histogram_query_phi_bins > 0, "histogram_query_phi_bins must be positive"
+
+        # Curriculum scheduling for local cross-attention
+        self.curriculum_cfg = curriculum_lca or {}
+        self.curriculum_enabled = bool(self.curriculum_cfg.get("enable", False))
+        if self.curriculum_enabled:
+            assert self.local_strided_attn, "curriculum_lca requires local_strided_attn to be True"
+        self.curriculum_warmup_epochs = int(self.curriculum_cfg.get("warmup_epochs", 0))
+        self.curriculum_anneal_epochs = int(self.curriculum_cfg.get("anneal_epochs", 0))
+        self.curriculum_start_window = (
+            int(self.curriculum_cfg["start_window_size"]) if self.curriculum_cfg.get("start_window_size") is not None else None
+        )
+        self.curriculum_end_window = (
+            int(self.curriculum_cfg["end_window_size"]) if self.curriculum_cfg.get("end_window_size") is not None else self.window_size
+        )
+        self.curriculum_force_mask_attention = bool(self.curriculum_cfg.get("warmup_use_mask_attention", False))
+        self._curriculum_epoch: int | None = None
+        self._curriculum_step: int | None = None
+
+        # Optional query modulation (extra capacity + phi-conditioned FiLM)
+        self.query_mlp: nn.Module | None = None
+        self.phi_film: nn.Module | None = None
+        self.phi_film_scale: float = 0.0
+        self.phi_film_shift_scale: float = 0.0
+        self.use_phi_film: bool = False
+        self._init_query_modulation(query_modulation)
 
         # LCA shift parameters
         self.lca_shift_absolute = int(lca_shift_absolute) if lca_shift_absolute is not None else None
@@ -332,6 +359,10 @@ class MaskFormerDecoder(nn.Module):
 
         batch_size = x["key_embed"].shape[0]
         num_constituents = x["key_embed"].shape[-2]
+        curriculum_state = self._get_curriculum_state(num_constituents)
+        use_local_strided = self.local_strided_attn and bool(curriculum_state["use_local_strided"])
+        effective_window_size = curriculum_state["window_size"] if use_local_strided else None
+        force_mask_attention = bool(curriculum_state["force_mask_attention"])
 
         # Generate the queries that represent objects
         if self.dynamic_queries:
@@ -346,8 +377,13 @@ class MaskFormerDecoder(nn.Module):
             x["query_embed"] = self.initial_queries.expand(batch_size, -1, -1)
             x["query_valid"] = torch.full((batch_size, self.num_queries), True, device=x["query_embed"].device)
 
+        if self.query_mlp is not None:
+            x["query_embed"] = self.query_mlp(x["query_embed"])
+
         if self.posenc:
             x["query_posenc"], x["key_posenc"] = self.generate_positional_encodings(x)
+        if self.use_phi_film and "query_phi" in x and self.phi_film is not None:
+            x["query_embed"] = self._apply_phi_film(x["query_embed"], x["query_phi"])
 
         attn_mask_lca = attn_mask_lca_transpose = attn_bias_lca = attn_bias_lca_transpose = None
         attn_mask_lca_first = attn_mask_lca_first_transpose = None
@@ -358,12 +394,13 @@ class MaskFormerDecoder(nn.Module):
                 raise ValueError("query_phi and key_phi are required when local_strided_mask_from_phi is True")
             query_phi_for_lca = x["query_phi"]
             key_phi_for_lca = x["key_phi"]
-        if self.local_strided_attn:
+        if use_local_strided:
             assert x["query_embed"].shape[0] == 1, "Local strided attention only supports batch size 1"
+            window_for_masks = effective_window_size if effective_window_size is not None else self.window_size
             attn_mask_lca, attn_mask_lca_transpose, attn_bias_lca, attn_bias_lca_transpose = self.build_local_strided_artifacts(
                 x["query_embed"],
                 x["key_embed"],
-                self.window_size,
+                window_for_masks,
                 self.local_strided_decay_tau if self.local_strided_decay else None,
                 query_phi=query_phi_for_lca,
                 key_phi=key_phi_for_lca,
@@ -398,7 +435,8 @@ class MaskFormerDecoder(nn.Module):
                 outputs[f"layer_{layer_index}"]["query_phi"] = x["query_phi"].detach().clone()
             if self.log_key_phi and "key_phi" in x:
                 outputs[f"layer_{layer_index}"]["key_phi"] = x["key_phi"].detach().clone()
-            if not self.mask_attention:
+            base_mask_attention = self.mask_attention or (force_mask_attention and not use_local_strided)
+            if not base_mask_attention:
                 layer_uses_mask_attention = False
             elif self.mask_attention_first_layer_only:
                 layer_uses_mask_attention = layer_index == 0
@@ -410,9 +448,9 @@ class MaskFormerDecoder(nn.Module):
                 layer_uses_mask_attention = layer_index >= self.mask_attention_start_layer
 
             if self.local_strided_first_layer_only:
-                layer_uses_local_strided = self.local_strided_attn and (layer_index == 0)
+                layer_uses_local_strided = use_local_strided and (layer_index == 0)
             else:
-                layer_uses_local_strided = self.local_strided_attn and (layer_index >= self.local_strided_start_layer)
+                layer_uses_local_strided = use_local_strided and (layer_index >= self.local_strided_start_layer)
             layer_uses_phi_distance_mask = self.use_phi_distance_mask
 
             # if maskattention, PE should be added before generating the mask
@@ -556,6 +594,9 @@ class MaskFormerDecoder(nn.Module):
                     current_lca_mask_transpose = attn_mask_lca_transpose
                     current_lca_bias = attn_bias_lca
                     current_lca_bias_transpose = attn_bias_lca_transpose
+
+            if layer_uses_local_strided and effective_window_size is not None:
+                outputs[f"layer_{layer_index}"]["lca_window_size"] = torch.tensor(effective_window_size, device=x["key_embed"].device)
 
             if layer_uses_local_strided and current_lca_mask is not None and torch.is_tensor(current_lca_mask):
                 outputs[f"layer_{layer_index}"]["lca_mask"] = current_lca_mask.detach().clone()
@@ -826,6 +867,73 @@ class MaskFormerDecoder(nn.Module):
                 x = unmerge_inputs(x, input_names)
 
         return x, outputs
+
+    def _init_query_modulation(self, cfg: dict | None) -> None:
+        cfg = cfg or {}
+
+        mlp_cfg = cfg.get("query_mlp") if cfg else None
+        if mlp_cfg:
+            self.query_mlp = Dense(
+                input_size=self.dim,
+                output_size=self.dim,
+                hidden_layers=mlp_cfg.get("hidden_layers"),
+                hidden_dim_scale=mlp_cfg.get("hidden_dim_scale", 2),
+                activation=mlp_cfg.get("activation"),
+            )
+
+        film_cfg = cfg.get("phi_film") if cfg else None
+        if film_cfg:
+            self.use_phi_film = bool(film_cfg.get("use", False))
+            if self.use_phi_film:
+                hidden_dim = int(film_cfg.get("dim", max(32, self.dim // 4)))
+                activation_name = film_cfg.get("activation", "SiLU")
+                activation = getattr(nn, activation_name, nn.SiLU)
+                self.phi_film = nn.Sequential(
+                    nn.Linear(2, hidden_dim),
+                    activation(),
+                    nn.Linear(hidden_dim, self.dim * 2),
+                )
+                nn.init.zeros_(self.phi_film[-1].weight)
+                nn.init.zeros_(self.phi_film[-1].bias)
+                self.phi_film_scale = float(film_cfg.get("scale", 0.1))
+                self.phi_film_shift_scale = float(film_cfg.get("shift_scale", 0.0))
+
+    def set_curriculum_progress(self, epoch: int | None = None, global_step: int | None = None) -> None:
+        self._curriculum_epoch = epoch
+        self._curriculum_step = global_step
+
+    def _get_curriculum_state(self, kv_len: int) -> dict[str, object]:
+        if not self.curriculum_enabled:
+            return {"use_local_strided": self.local_strided_attn, "window_size": self.window_size, "force_mask_attention": False}
+
+        if self._curriculum_epoch is None:
+            return {"use_local_strided": self.local_strided_attn, "window_size": self.window_size, "force_mask_attention": False}
+
+        epoch = self._curriculum_epoch
+        if epoch < self.curriculum_warmup_epochs:
+            return {"use_local_strided": False, "window_size": None, "force_mask_attention": self.curriculum_force_mask_attention}
+
+        progress = 1.0
+        if self.curriculum_anneal_epochs > 0:
+            progress = min(max((epoch - self.curriculum_warmup_epochs) / self.curriculum_anneal_epochs, 0.0), 1.0)
+
+        start_window = self.curriculum_start_window if self.curriculum_start_window is not None else kv_len
+        end_window = self.curriculum_end_window if self.curriculum_end_window is not None else self.window_size
+        window = int(round(start_window + (end_window - start_window) * progress))
+        window = max(1, window)
+        if window % 2 != 0:
+            window += 1
+
+        return {"use_local_strided": True, "window_size": window, "force_mask_attention": False}
+
+    def _apply_phi_film(self, query_embed: Tensor, query_phi: Tensor) -> Tensor:
+        phi_feats = torch.stack((torch.sin(query_phi), torch.cos(query_phi)), dim=-1)
+        film = self.phi_film(phi_feats)
+        film = film.view(*query_embed.shape[:-1], 2, self.dim)
+        scale_raw, shift_raw = torch.unbind(film, dim=-2)
+        scale = 1 + self.phi_film_scale * torch.tanh(scale_raw)
+        shift = self.phi_film_shift_scale * shift_raw
+        return query_embed * scale + shift
 
     def _compute_diagnostic_task_mask(self, x: dict[str, Tensor], stage_name: str) -> dict[str, Tensor] | None:
         """Compute task attention mask for diagnostic logging.

@@ -1,10 +1,11 @@
+import math
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
 from hepattn.models.decoder import MaskFormerDecoder
-from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask
+from hepattn.models.task import IncidenceRegressionTask, ObjectClassificationTask, ObjectHitMaskTask
 from hepattn.utils.model_utils import unmerge_inputs
 
 
@@ -22,6 +23,7 @@ class MaskFormer(nn.Module):
         input_sort_field: str | None = None,
         sorter: nn.Module | None = None,
         unified_decoding: bool = False,
+        phi_alignment: dict | None = None,
     ):
         """Initializes the MaskFormer model, which is a modular transformer-style architecture designed
         for multi-task object reconstruction with attention-based decoding and optional encoder blocks.
@@ -51,6 +53,9 @@ class MaskFormer(nn.Module):
         self.matcher = matcher
         self.unified_decoding = unified_decoding
         self.decoder.unified_decoding = unified_decoding
+        self._current_epoch: int | None = None
+        self._need_query_phi = False
+        self.phi_alignment_cfg = self._init_phi_alignment(phi_alignment)
 
         assert not (input_sort_field and sorter), "Cannot specify both input_sort_field and sorter."
         self.input_sort_field = input_sort_field
@@ -65,6 +70,57 @@ class MaskFormer(nn.Module):
     @property
     def input_names(self) -> list[str]:
         return [input_net.input_name for input_net in self.input_nets]
+
+    def set_training_progress(self, epoch: int | None = None, global_step: int | None = None) -> None:
+        """Expose training progress to submodules that need scheduling."""
+        self._current_epoch = epoch
+        if hasattr(self.decoder, "set_curriculum_progress"):
+            self.decoder.set_curriculum_progress(epoch=epoch, global_step=global_step)
+
+    def _init_phi_alignment(self, cfg: dict | None) -> dict:
+        cfg = cfg or {}
+        weight = float(cfg.get("weight", 0.0))
+        enabled = bool(cfg.get("use", False)) and weight > 0
+        result = {
+            "enabled": enabled,
+            "weight": weight,
+            "layer": cfg.get("layer", "final"),
+            "warmup_epochs": int(cfg.get("warmup_epochs", 0)),
+            "input_name": cfg.get("input_name", self.input_names[0] if self.input_names else None),
+            "phi_field": cfg.get("phi_field", "phi"),
+            "eps": float(cfg.get("eps", 1e-6)),
+            "mask_task": None,
+            "logit_key": None,
+        }
+        if not enabled:
+            return result
+
+        mask_task_name = cfg.get("mask_task")
+        task = self._find_mask_task(mask_task_name)
+        if task is None:
+            # Disable gracefully if we cannot find a usable mask task
+            result["enabled"] = False
+            return result
+
+        result["mask_task"] = task
+        result["mask_task_name"] = task.name
+        result["logit_key"] = task.output_object_hit + "_logit"
+        # Ensure query phi is available for loss computation
+        self.decoder.log_query_phi = True
+        self._need_query_phi = True
+        return result
+
+    def _find_mask_task(self, mask_task_name: str | None) -> ObjectHitMaskTask | None:
+        if mask_task_name is not None:
+            for task in self.tasks:
+                if task.name == mask_task_name and isinstance(task, ObjectHitMaskTask):
+                    return task
+            return None
+
+        for task in self.tasks:
+            if isinstance(task, ObjectHitMaskTask):
+                return task
+        return None
 
     def forward(self, inputs: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         batch_size = inputs[self.input_names[0] + "_valid"].shape[0]
@@ -142,6 +198,9 @@ class MaskFormer(nn.Module):
             sort_dict = {f"{name}_{sort}": inputs[f"{name}_{sort}"] for name in self.input_names}
             outputs["final"][sort] = sort_dict
 
+        if self._need_query_phi:
+            outputs["final"]["query_phi"] = x.get("query_phi")
+
         return outputs
 
     def predict(self, outputs: dict) -> dict:
@@ -167,7 +226,7 @@ class MaskFormer(nn.Module):
 
         return preds
 
-    def loss(self, outputs: dict, targets: dict) -> tuple[dict, dict]:
+    def loss(self, outputs: dict, targets: dict, inputs: dict | None = None, epoch: int | None = None) -> tuple[dict, dict]:
         """Computes the loss between the forward pass of the model and the data / targets.
         It first computes the cost / loss between each of the predicted and true tracks in each ROI
         and then uses the Hungarian algorihtm to perform an optimal bipartite matching. The model
@@ -245,6 +304,9 @@ class MaskFormer(nn.Module):
                 # Get the indicies that can permute the predictions to yield their optimal matching
                 pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
 
+            if "query_phi" in outputs[layer_name]:
+                outputs[layer_name]["query_phi"] = outputs[layer_name]["query_phi"][batch_idxs, pred_idxs]
+
             for task in self.tasks:
                 # Tasks without a object dimension do not need permutation (constituent-level or sample-level)
                 if not task.permute_loss:
@@ -274,4 +336,72 @@ class MaskFormer(nn.Module):
 
                 losses[layer_name][task.name] = task_losses
 
+        phi_loss = self._phi_alignment_loss(outputs, targets, inputs=inputs, epoch=epoch)
+        if phi_loss is not None:
+            layer = self.phi_alignment_cfg["layer"]
+            if layer not in losses:
+                losses[layer] = {}
+            losses[layer].setdefault("phi_alignment", {})
+            losses[layer]["phi_alignment"]["phi_align"] = phi_loss
+
         return losses, targets
+
+    def _phi_alignment_loss(self, outputs: dict, targets: dict, inputs: dict | None, epoch: int | None) -> Tensor | None:
+        cfg = self.phi_alignment_cfg
+        if not cfg["enabled"]:
+            return None
+        if inputs is None:
+            return None
+        if epoch is None:
+            epoch = self._current_epoch
+        if epoch is not None and epoch < cfg["warmup_epochs"]:
+            return None
+
+        layer = cfg["layer"]
+        task = cfg["mask_task"]
+        logit_key = cfg["logit_key"]
+        if task is None or logit_key is None:
+            return None
+        if layer not in outputs or task.name not in outputs[layer]:
+            return None
+
+        layer_outputs = outputs[layer]
+        logits = layer_outputs[task.name].get(logit_key)
+        query_phi = layer_outputs.get("query_phi")
+        if logits is None or query_phi is None:
+            return None
+
+        input_name = cfg["input_name"]
+        if input_name is None:
+            return None
+        phi_key = f"{input_name}_{cfg['phi_field']}"
+        hit_phi = inputs.get(phi_key)
+        if hit_phi is None:
+            return None
+
+        hit_valid = inputs.get(f"{input_name}_valid")
+        query_valid = targets.get(f"{self.target_object}_valid")
+
+        probs = logits.sigmoid()
+        if hit_valid is not None:
+            probs = probs * hit_valid.unsqueeze(1).to(probs.dtype)
+
+        phi = hit_phi.to(probs.dtype)
+        sin_mean = (probs * phi.sin().unsqueeze(1)).sum(dim=-1)
+        cos_mean = (probs * phi.cos().unsqueeze(1)).sum(dim=-1)
+        weight_sum = probs.sum(dim=-1)
+        valid_hits = weight_sum > cfg["eps"]
+        weight_sum = weight_sum.clamp_min(cfg["eps"])
+
+        mean_phi = torch.atan2(sin_mean / weight_sum, cos_mean / weight_sum)
+        phi_diff = query_phi - mean_phi
+        phi_diff = (phi_diff + math.pi) % (2 * math.pi) - math.pi
+
+        if query_valid is not None:
+            valid_hits = valid_hits & query_valid
+
+        if not valid_hits.any():
+            return None
+
+        phi_loss = (phi_diff[valid_hits] ** 2).mean()
+        return cfg["weight"] * phi_loss

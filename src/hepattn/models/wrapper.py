@@ -93,11 +93,14 @@ class ModelWrapper(LightningModule):
         if hasattr(self.model, "decoder") and getattr(self.model.decoder, "dynamic_queries", False):
             inputs["num_truth_particles"] = targets[f"{self.model.target_object}_valid"].sum()
 
+        if hasattr(self.model, "set_training_progress"):
+            self.model.set_training_progress(epoch=self.current_epoch, global_step=self.global_step)
+
         # Get the model outputs
         outputs = self.model(inputs)
 
         # Compute and log losses
-        losses, targets = self.model.loss(outputs, targets)
+        losses, targets = self.model.loss(outputs, targets, inputs=inputs, epoch=self.current_epoch)
 
         # Get the predictions from the model, avoid calling predict if possible
         if batch_idx % self.trainer.log_every_n_steps == 0:
@@ -128,11 +131,14 @@ class ModelWrapper(LightningModule):
         if hasattr(self.model, "decoder") and getattr(self.model.decoder, "dynamic_queries", False):
             inputs["num_truth_particles"] = targets[f"{self.model.target_object}_valid"].sum()
 
+        if hasattr(self.model, "set_training_progress"):
+            self.model.set_training_progress(epoch=self.current_epoch, global_step=self.global_step)
+
         # Get the raw model outputs
         outputs = self.model(inputs)
 
         # Compute losses then aggregate and log them
-        losses, targets = self.model.loss(outputs, targets)
+        losses, targets = self.model.loss(outputs, targets, inputs=inputs, epoch=self.current_epoch)
         total_loss = self.aggregate_losses(losses, stage="val")
 
         # Get the predictions from the model
@@ -148,10 +154,13 @@ class ModelWrapper(LightningModule):
         if hasattr(self.model, "decoder") and getattr(self.model.decoder, "dynamic_queries", False):
             inputs["num_truth_particles"] = targets[f"{self.model.target_object}_valid"].sum()
 
+        if hasattr(self.model, "set_training_progress"):
+            self.model.set_training_progress(epoch=self.current_epoch, global_step=self.global_step)
+
         outputs = self.model(inputs)
 
         # Calculate loss to also run matching
-        losses, targets = self.model.loss(outputs, targets)
+        losses, targets = self.model.loss(outputs, targets, inputs=inputs, epoch=self.current_epoch)
 
         # Get the predictions from the model
         preds = self.model.predict(outputs)
