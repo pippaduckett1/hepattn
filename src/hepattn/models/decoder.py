@@ -200,12 +200,8 @@ class MaskFormerDecoder(nn.Module):
             assert self.local_strided_attn, "curriculum_lca requires local_strided_attn to be True"
         self.curriculum_warmup_epochs = int(self.curriculum_cfg.get("warmup_epochs", 0))
         self.curriculum_anneal_epochs = int(self.curriculum_cfg.get("anneal_epochs", 0))
-        self.curriculum_start_window = (
-            int(self.curriculum_cfg["start_window_size"]) if self.curriculum_cfg.get("start_window_size") is not None else None
-        )
-        self.curriculum_end_window = (
-            int(self.curriculum_cfg["end_window_size"]) if self.curriculum_cfg.get("end_window_size") is not None else self.window_size
-        )
+        self.curriculum_start_window = self._optional_int(self.curriculum_cfg, "start_window_size")
+        self.curriculum_end_window = self._optional_int(self.curriculum_cfg, "end_window_size", default=self.window_size)
         self.curriculum_force_mask_attention = bool(self.curriculum_cfg.get("warmup_use_mask_attention", False))
         self._curriculum_epoch: int | None = None
         self._curriculum_step: int | None = None
@@ -901,6 +897,20 @@ class MaskFormerDecoder(nn.Module):
     def set_curriculum_progress(self, epoch: int | None = None, global_step: int | None = None) -> None:
         self._curriculum_epoch = epoch
         self._curriculum_step = global_step
+
+    @staticmethod
+    def _optional_int(cfg: dict, key: str, default: int | None = None) -> int | None:
+        if key not in cfg:
+            return default
+        val = cfg.get(key)
+        if val is None:
+            return default
+        if isinstance(val, str) and val.lower() in {"none", "null"}:
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
 
     def _get_curriculum_state(self, kv_len: int) -> dict[str, object]:
         if not self.curriculum_enabled:
