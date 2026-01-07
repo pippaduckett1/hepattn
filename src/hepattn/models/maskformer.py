@@ -351,6 +351,10 @@ class MaskFormer(nn.Module):
 
                 losses[layer_name][task.name] = task_losses
 
+            if "mask_consistency_loss" in outputs[layer_name]:
+                losses[layer_name].setdefault("decoder", {})
+                losses[layer_name]["decoder"]["mask_consistency"] = outputs[layer_name]["mask_consistency_loss"]
+
         phi_loss = self._phi_alignment_loss(outputs, targets, inputs=inputs, epoch=epoch)
         if phi_loss is not None:
             layer = self.phi_alignment_cfg["layer"]

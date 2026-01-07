@@ -462,10 +462,13 @@ class MaskFormerDecoder(nn.Module):
                 compute_attn_mask = True
 
             apply_task_mask = compute_attn_mask and layer_uses_mask_attention
-            collect_task_masks = compute_attn_mask and (layer_uses_mask_attention or layer_uses_local_strided or layer_uses_phi_distance_mask)
+            collect_task_masks = compute_attn_mask and (
+                layer_uses_mask_attention or layer_uses_local_strided or layer_uses_phi_distance_mask or self.mask_consistency_weight > 0
+            )
 
             attn_masks: dict[str, torch.Tensor] = {}
             attn_biases: dict[str, torch.Tensor] = {}
+            attn_logits: dict[str, torch.Tensor] = {}
             use_task_masks = collect_task_masks
             query_mask = None
             layer_attn_mask: torch.Tensor | None = None
@@ -498,6 +501,10 @@ class MaskFormerDecoder(nn.Module):
                             attn_masks[input_name] |= task_attn_mask
                         else:
                             attn_masks[input_name] = task_attn_mask
+                        if self.mask_consistency_weight > 0 and hasattr(task, "output_object_hit"):
+                            logit_key = task.output_object_hit + "_logit"
+                            if logit_key in task_outputs:
+                                attn_logits[input_name] = task_outputs[logit_key]
                         # Collect logits for biasing attention if enabled
                         if self.mask_attention_bias_scale > 0 and hasattr(task, "output_object_hit"):
                             logit_key = task.output_object_hit + "_logit"
@@ -521,6 +528,7 @@ class MaskFormerDecoder(nn.Module):
 
             task_attn_mask: torch.Tensor | None = None
             task_attn_bias: torch.Tensor | None = None
+            task_attn_logit: torch.Tensor | None = None
             if attn_masks:
                 if self.unified_decoding:
                     if len(attn_masks) > 1:
@@ -528,6 +536,10 @@ class MaskFormerDecoder(nn.Module):
                     task_attn_mask = next(iter(attn_masks.values()))
                     if task_attn_mask.dim() == 2:
                         task_attn_mask = task_attn_mask.unsqueeze(-1).expand(-1, -1, num_constituents)
+                    if attn_logits:
+                        task_attn_logit = next(iter(attn_logits.values()))
+                        if task_attn_logit.dim() == 2:
+                            task_attn_logit = task_attn_logit.unsqueeze(-1).expand(-1, -1, num_constituents)
                     if attn_biases:
                         task_attn_bias = next(iter(attn_biases.values()))
                         if task_attn_bias.dim() == 2:
@@ -540,9 +552,14 @@ class MaskFormerDecoder(nn.Module):
                         device=x["key_embed"].device,
                         dtype=x["key_embed"].dtype,
                     )
+                    task_attn_logit = torch.zeros_like(task_attn_bias) if attn_logits else None
                     for input_name, mask in attn_masks.items():
                         task_mask = mask.flatten()
                         task_attn_mask[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_mask)] = task_mask
+                    if attn_logits:
+                        for input_name, logit in attn_logits.items():
+                            task_logit = logit.flatten()
+                            task_attn_logit[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_logit)] = task_logit
                     for input_name, bias in attn_biases.items():
                         task_bias = bias.flatten().to(task_attn_bias.dtype)
                         task_attn_bias[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_bias)] = task_bias
@@ -616,6 +633,35 @@ class MaskFormerDecoder(nn.Module):
                 if current_lca_bias is not None and torch.is_tensor(current_lca_bias):
                     layer_attn_bias = current_lca_bias
                     layer_attn_bias_transpose = current_lca_bias_transpose
+
+            # Optional auxiliary loss: encourage predicted task mask to match a reference structure
+            if self.mask_consistency_weight > 0 and task_attn_logit is not None:
+                ref_mask: torch.Tensor | None = None
+                if self.mask_consistency_source == "lca":
+                    if layer_uses_local_strided and current_lca_mask is not None and torch.is_tensor(current_lca_mask):
+                        ref_mask = current_lca_mask
+                elif self.mask_consistency_source == "phi_distance":
+                    if layer_attn_mask is not None and torch.is_tensor(layer_attn_mask):
+                        ref_mask = layer_attn_mask
+                    else:
+                        try:
+                            ref_mask = self.compute_phi_distance_mask(x)
+                        except Exception:
+                            ref_mask = None
+                elif self.mask_consistency_source == "attn":
+                    if layer_attn_mask is not None and torch.is_tensor(layer_attn_mask):
+                        ref_mask = layer_attn_mask
+                    elif "attn_mask" in outputs[f"layer_{layer_index}"] and torch.is_tensor(
+                        outputs[f"layer_{layer_index}"]["attn_mask"]
+                    ):
+                        ref_mask = outputs[f"layer_{layer_index}"]["attn_mask"]
+
+                if ref_mask is not None and torch.is_tensor(ref_mask):
+                    ref_mask_float = ref_mask.to(task_attn_logit.dtype)
+                    if ref_mask_float.shape != task_attn_logit.shape:
+                        ref_mask_float = ref_mask_float.expand_as(task_attn_logit)
+                    consistency_loss = torch.nn.functional.binary_cross_entropy_with_logits(task_attn_logit, ref_mask_float)
+                    outputs[f"layer_{layer_index}"]["mask_consistency_loss"] = self.mask_consistency_weight * consistency_loss
 
             if layer_attn_mask is not None and f"layer_{layer_index}" in outputs:
                 if "attn_mask" not in outputs[f"layer_{layer_index}"]:
