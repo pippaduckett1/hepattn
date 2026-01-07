@@ -295,6 +295,21 @@ class MaskFormer(nn.Module):
             if cost is None:
                 continue
 
+            # Preserve pre-permutation diagnostics
+            if layer_name in outputs:
+                layer_out = outputs[layer_name]
+                if isinstance(layer_out, dict):
+                    if "query_phi" in layer_out and "query_phi_unmatched" not in layer_out:
+                        layer_out["query_phi_unmatched"] = layer_out["query_phi"].detach().clone()
+                    if "attn_mask" in layer_out and "attn_mask_unmatched" not in layer_out:
+                        attn_mask_val = layer_out["attn_mask"]
+                        if torch.is_tensor(attn_mask_val):
+                            layer_out["attn_mask_unmatched"] = attn_mask_val.detach().clone()
+                    if "task_attn_mask" in layer_out and "task_attn_mask_unmatched" not in layer_out:
+                        task_mask_val = layer_out["task_attn_mask"]
+                        if torch.is_tensor(task_mask_val):
+                            layer_out["task_attn_mask_unmatched"] = task_mask_val.detach().clone()
+
             if use_dynamic_queries:
                 # With dynamic queries, num_queries = num_truth_particles
                 # Use identity matching - predictions already correspond 1:1 with truth

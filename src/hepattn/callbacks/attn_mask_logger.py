@@ -29,7 +29,7 @@ class AttnMaskLogger(Callback):
         log_query_vs_truth_phi: bool = False,
         log_predicted_masks: bool = False,
         predicted_mask_threshold: float = 0.5,
-        log_all_layers: bool = False,
+        log_all_layers: bool = True,
         log_query_mask_phi_distribution: bool = False,
         log_attn_mask_with_query_overlay: bool = False,
         # Selective mask logging - set to False to reduce image count
@@ -96,17 +96,13 @@ class AttnMaskLogger(Callback):
                 origin="lower",
             )
 
-            # Determine if phi is ascending or descending with index
+            # Determine if phi is ascending or descending with index (for labeling arrows only)
             query_phi_ascending = True
             key_phi_ascending = True
             if query_phi_1d is not None and query_phi_1d.numel() > 1:
                 query_phi_ascending = query_phi_1d[-1].item() > query_phi_1d[0].item()
             if key_phi_1d is not None and key_phi_1d.numel() > 1:
                 key_phi_ascending = key_phi_1d[-1].item() > key_phi_1d[0].item()
-
-            # Flip y-axis so lowest phi is at the bottom (only if phi is ascending with index)
-            if query_phi_ascending:
-                ax.invert_yaxis()
 
             # Add colorbar with clear labels
             cbar = plt.colorbar(im, ax=ax, ticks=[0, 1])
@@ -219,16 +215,13 @@ class AttnMaskLogger(Callback):
             )
             print(f"[ATTN_WEIGHTS] imshow complete")
 
-            # Determine phi ordering for axis inversion
+            # Determine phi ordering for labeling arrows only
             query_phi_ascending = True
             key_phi_ascending = True
             if query_phi_1d is not None and query_phi_1d.numel() > 1:
                 query_phi_ascending = query_phi_1d[-1].item() > query_phi_1d[0].item()
             if key_phi_1d is not None and key_phi_1d.numel() > 1:
                 key_phi_ascending = key_phi_1d[-1].item() > key_phi_1d[0].item()
-
-            if query_phi_ascending:
-                ax.invert_yaxis()
 
             cbar = plt.colorbar(im, ax=ax)
             cbar.set_label("Attention Weight", rotation=270, labelpad=15)
@@ -718,10 +711,10 @@ class AttnMaskLogger(Callback):
                 task_mask = l_out.get("task_attn_mask")
 
                 if self.log_all_layers or layer_index == max(layer_indices):
-                    attn_mask = l_out.get("attn_mask")
+                    attn_mask = l_out.get("attn_mask_unmatched") if "attn_mask_unmatched" in l_out else l_out.get("attn_mask")
                     # Use helper functions to handle dimension variations
                     attn_mask_im = self._ensure_2d_cpu(attn_mask).clone().int() if attn_mask is not None else None
-                    query_sample = self._ensure_1d_cpu(query_phi)
+                    query_sample = self._ensure_1d_cpu(l_out.get("query_phi_unmatched", query_phi))
                     key_sample = self._ensure_1d_cpu(key_phi)
                     query_mask_sample = None
                     if query_mask is not None:
@@ -756,7 +749,7 @@ class AttnMaskLogger(Callback):
                                 kv_im,
                                 step,
                                 layer_index,
-                                f"local_ma_mask_kv_{prefix_suffix}",
+                                f"local_kv_mask_{prefix_suffix}",
                                 query_phi=key_sample,
                                 key_phi=query_sample,
                             )
@@ -774,7 +767,8 @@ class AttnMaskLogger(Callback):
                             invalid_mask=invalid_mask_sample,
                         )
                     if self.log_task_mask and task_mask is not None:
-                        task_im = self._ensure_2d_cpu(task_mask).clone().int()
+                        task_mask_src = l_out.get("task_attn_mask_unmatched", task_mask)
+                        task_im = self._ensure_2d_cpu(task_mask_src).clone().int()
                         self._log_attention_mask(
                             pl_module,
                             task_im,
