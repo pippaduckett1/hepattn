@@ -631,8 +631,15 @@ class MaskFormerDecoder(nn.Module):
                     if not torch.is_tensor(current_lca_mask):
                         layer_attn_mask_transpose = current_lca_mask_transpose
                 if current_lca_bias is not None and torch.is_tensor(current_lca_bias):
-                    layer_attn_bias = current_lca_bias
-                    layer_attn_bias_transpose = current_lca_bias_transpose
+                    if layer_attn_bias is None:
+                        layer_attn_bias = current_lca_bias
+                    elif torch.is_tensor(layer_attn_bias):
+                        layer_attn_bias = layer_attn_bias + current_lca_bias
+                    if current_lca_bias_transpose is not None:
+                        if layer_attn_bias_transpose is None:
+                            layer_attn_bias_transpose = current_lca_bias_transpose
+                        elif torch.is_tensor(layer_attn_bias_transpose):
+                            layer_attn_bias_transpose = layer_attn_bias_transpose + current_lca_bias_transpose
 
             # Optional auxiliary loss: encourage predicted task mask to match a reference structure
             if self.mask_consistency_weight > 0 and task_attn_logit is not None:
