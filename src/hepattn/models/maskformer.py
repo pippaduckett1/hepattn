@@ -2,6 +2,7 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hepattn.models.decoder import MaskFormerDecoder
@@ -422,5 +423,11 @@ class MaskFormer(nn.Module):
         if not valid_hits.any():
             return None
 
-        phi_loss = (phi_diff[valid_hits] ** 2).mean()
+        num_queries = phi_diff.shape[1]
+        bin_half_width = math.pi / max(num_queries, 1)  # half the bin size (2π / num_queries) / 2
+        abs_diff = phi_diff.abs()
+        # Soft hinge outside the bin using softplus for smoothness
+        excess = F.softplus(abs_diff - bin_half_width)
+
+        phi_loss = (excess[valid_hits] ** 2).mean()
         return cfg["weight"] * phi_loss
