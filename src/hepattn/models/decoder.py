@@ -431,9 +431,9 @@ class MaskFormerDecoder(nn.Module):
                 outputs[f"layer_{layer_index}"]["query_phi"] = x["query_phi"].detach().clone()
             if self.log_key_phi and "key_phi" in x:
                 outputs[f"layer_{layer_index}"]["key_phi"] = x["key_phi"].detach().clone()
-            base_mask_attention = self.mask_attention or (force_mask_attention and not use_local_strided)
-            if not base_mask_attention:
-                layer_uses_mask_attention = False
+        base_mask_attention = self.mask_attention or force_mask_attention
+        if not base_mask_attention:
+            layer_uses_mask_attention = False
             elif self.mask_attention_first_layer_only:
                 layer_uses_mask_attention = layer_index == 0
             elif self.mask_attention_last_layer_only:
@@ -614,15 +614,19 @@ class MaskFormerDecoder(nn.Module):
             if layer_uses_local_strided and current_lca_mask is not None and torch.is_tensor(current_lca_mask):
                 outputs[f"layer_{layer_index}"]["lca_mask"] = current_lca_mask.detach().clone()
 
+            effective_combine_mode = self.combine_ma_lca
+            if effective_combine_mode is None and force_mask_attention:
+                effective_combine_mode = "OR"
+
             if layer_uses_local_strided and current_lca_mask is not None:
                 if layer_attn_mask is not None:
-                    if not self.combine_ma_lca:
+                    if not effective_combine_mode:
                         raise AssertionError(
                             "combine_ma_lca must be provided when both mask_attention and local_strided_attn are active on the same decoder layer"
                         )
                     if not (torch.is_tensor(layer_attn_mask) and torch.is_tensor(current_lca_mask)):
                         raise ValueError("combine_ma_lca currently requires tensor attention masks")
-                    if self.combine_ma_lca == "OR":
+                    if effective_combine_mode == "OR":
                         layer_attn_mask = layer_attn_mask | current_lca_mask
                     else:
                         layer_attn_mask = layer_attn_mask & current_lca_mask
@@ -965,6 +969,17 @@ class MaskFormerDecoder(nn.Module):
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _normalize_window_size(window_size: int | float | None, kv_len: int) -> int:
+        """Clamp and even-ify a window size relative to the kv length."""
+        if window_size is None:
+            window_size = kv_len
+        window = int(round(float(window_size)))
+        window = max(1, min(window, kv_len))
+        if window % 2 != 0 and window > 1:
+            window = window - 1 if window == kv_len else window + 1
+        return window
+
     def _get_curriculum_state(self, kv_len: int) -> dict[str, object]:
         if not self.curriculum_enabled:
             return {"use_local_strided": self.local_strided_attn, "window_size": self.window_size, "force_mask_attention": False}
@@ -973,19 +988,23 @@ class MaskFormerDecoder(nn.Module):
             return {"use_local_strided": self.local_strided_attn, "window_size": self.window_size, "force_mask_attention": False}
 
         epoch = self._curriculum_epoch
+        start_window_cfg = self.curriculum_start_window
+        end_window_cfg = self.curriculum_end_window
+
         if epoch < self.curriculum_warmup_epochs:
-            return {"use_local_strided": False, "window_size": None, "force_mask_attention": self.curriculum_force_mask_attention}
+            if start_window_cfg is None:
+                return {"use_local_strided": False, "window_size": None, "force_mask_attention": self.curriculum_force_mask_attention}
+            warmup_window = self._normalize_window_size(start_window_cfg, kv_len)
+            return {"use_local_strided": True, "window_size": warmup_window, "force_mask_attention": self.curriculum_force_mask_attention}
 
         progress = 1.0
         if self.curriculum_anneal_epochs > 0:
             progress = min(max((epoch - self.curriculum_warmup_epochs) / self.curriculum_anneal_epochs, 0.0), 1.0)
 
-        start_window = self.curriculum_start_window if self.curriculum_start_window is not None else kv_len
-        end_window = self.curriculum_end_window if self.curriculum_end_window is not None else self.window_size
-        window = int(round(start_window + (end_window - start_window) * progress))
-        window = max(1, window)
-        if window % 2 != 0:
-            window += 1
+        start_window = self._normalize_window_size(start_window_cfg, kv_len)
+        end_window = self._normalize_window_size(end_window_cfg, kv_len)
+        interp_window = start_window + (end_window - start_window) * progress
+        window = self._normalize_window_size(interp_window, kv_len)
 
         return {"use_local_strided": True, "window_size": window, "force_mask_attention": False}
 
