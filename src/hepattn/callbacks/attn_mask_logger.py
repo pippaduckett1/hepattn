@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from lightning.pytorch.callbacks import Callback
 from matplotlib.colors import ListedColormap
+from torch.nn.attention.flex_attention import BlockMask
 
 from hepattn.utils.local_ca import auto_local_ca_mask
 
@@ -173,7 +174,11 @@ class AttnMaskLogger(Callback):
         """Ensure tensor is 2D and on CPU, handling batch dimensions."""
         if tensor is None:
             return None
-        t = tensor.detach()
+        if isinstance(tensor, BlockMask):
+            # Flex Attention BlockMask -> dense tensor for visualization
+            t = tensor.to_dense()
+        else:
+            t = tensor.detach()
         # Remove batch dimension if present (keep last 2 dims)
         while t.dim() > 2:
             t = t[0] if t.shape[0] == 1 else t.squeeze(0)
