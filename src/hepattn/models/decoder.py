@@ -431,9 +431,9 @@ class MaskFormerDecoder(nn.Module):
                 outputs[f"layer_{layer_index}"]["query_phi"] = x["query_phi"].detach().clone()
             if self.log_key_phi and "key_phi" in x:
                 outputs[f"layer_{layer_index}"]["key_phi"] = x["key_phi"].detach().clone()
-        base_mask_attention = self.mask_attention or force_mask_attention
-        if not base_mask_attention:
-            layer_uses_mask_attention = False
+            base_mask_attention = self.mask_attention or force_mask_attention
+            if not base_mask_attention:
+                layer_uses_mask_attention = False
             elif self.mask_attention_first_layer_only:
                 layer_uses_mask_attention = layer_index == 0
             elif self.mask_attention_last_layer_only:
@@ -616,6 +616,9 @@ class MaskFormerDecoder(nn.Module):
 
             effective_combine_mode = self.combine_ma_lca
             if effective_combine_mode is None and force_mask_attention:
+                effective_combine_mode = "OR"
+            if effective_combine_mode is None and layer_uses_local_strided and layer_uses_mask_attention:
+                # Default to OR when both masking mechanisms are active but no explicit combine mode was provided
                 effective_combine_mode = "OR"
 
             if layer_uses_local_strided and current_lca_mask is not None:
