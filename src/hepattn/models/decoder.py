@@ -558,7 +558,7 @@ class MaskFormerDecoder(nn.Module):
                         task_attn_mask[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_mask)] = task_mask
                     if attn_logits:
                         for input_name, logit in attn_logits.items():
-                            task_logit = logit.flatten()
+                            task_logit = logit.flatten().to(task_attn_logit.dtype)
                             task_attn_logit[x[f"key_is_{input_name}"].unsqueeze(1).expand_as(task_attn_logit)] = task_logit
                     for input_name, bias in attn_biases.items():
                         task_bias = bias.flatten().to(task_attn_bias.dtype)
