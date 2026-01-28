@@ -7,7 +7,9 @@ from functools import partial
 
 import torch
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask
 
+from hepattn.flex.blockmask import blockmask_from_attn_mask
 from hepattn.flex.fast_local_ca import build_strided_sliding_window_blockmask
 from hepattn.flex.local_ca import sliding_window_mask_strided, sliding_window_mask_strided_wrapped, transpose_blockmask
 from hepattn.models.attention import Attention
@@ -15,7 +17,7 @@ from hepattn.models.dense import Dense
 from hepattn.models.encoder import Residual
 from hepattn.models.norm import get_hybrid_norm_config
 from hepattn.models.posenc import pos_enc_symmetric
-from hepattn.utils.local_ca import auto_local_ca_mask
+from hepattn.utils.local_ca import auto_local_ca_mask, get_local_ca_mask
 from hepattn.utils.model_utils import unmerge_inputs
 
 
@@ -31,8 +33,10 @@ class MaskFormerDecoder(nn.Module):
         local_strided_attn: bool = False,
         window_size: int = 512,
         window_wrap: bool = True,
+        q_sa_diag_window_size: int | None = None,
         fast_local_ca: bool = False,
         block_size: int = 128,
+        mask_attention_final_layer: bool = False,
         unified_decoding: bool = False,
         phi_shift: float = 0.0,
         unmask_all_false: bool = True,
@@ -50,9 +54,12 @@ class MaskFormerDecoder(nn.Module):
             local_strided_attn: If True, uses local strided window attention.
             window_size: The size of the window for local strided window attention.
             window_wrap: If True, wraps the window for local strided window attention.
+            q_sa_diag_window_size: Optional window size for diagonal masking in query self-attention when using local strided attention.
             attn_type: The attention type to use (e.g., 'torch', 'flex').
             fast_local_ca: If True, uses fast local CA.
             block_size: The size of the block for fast local CA.
+            mask_attention_final_layer: If True, use mask attention only on the final decoder layer
+                when local_strided_attn is enabled.
             unified_decoding: If True, inputs remain merged for task processing instead of being unmerged after each layer.
             phi_shift: The shift in the phi angle for positional encoding.
             unmask_all_false: If True, queries with all-false attention masks will be unmasked to attend everywhere.
@@ -61,6 +68,7 @@ class MaskFormerDecoder(nn.Module):
         super().__init__()
 
         self.decoder_layers = nn.ModuleList([MaskFormerDecoderLayer(depth=i, **decoder_layer_config) for i in range(num_decoder_layers)])
+        self.requires_attn_mask_transpose = any(layer.bidirectional_ca for layer in self.decoder_layers)
         self.dim = decoder_layer_config["dim"]
         self.tasks: list | None = None  # Will be set by MaskFormer
         self.encoder_tasks: list | None = None  # Will be set by MaskFormer
@@ -72,8 +80,10 @@ class MaskFormerDecoder(nn.Module):
         self.attn_type = decoder_layer_config.get("attn_kwargs", {}).get("attn_type", "torch")
         self.window_size = window_size
         self.window_wrap = window_wrap
+        self.q_sa_diag_window_size = q_sa_diag_window_size
         self.unified_decoding = unified_decoding
         self.dynamic_queries = dynamic_queries
+        self.mask_attention_final_layer = mask_attention_final_layer
 
         # Only initialize learned queries if not using dynamic queries
         if not dynamic_queries:
@@ -88,7 +98,9 @@ class MaskFormerDecoder(nn.Module):
             assert self.attn_type in {"torch", "flex"}, (
                 f"Invalid attention type when local_strided_attn is True: {self.attn_type}, must be 'torch' or 'flex'"
             )
-        assert not (self.local_strided_attn and self.mask_attention), "local_strided_attn and mask_attention cannot both be True"
+        assert not (self.local_strided_attn and self.mask_attention and not self.mask_attention_final_layer), (
+            "local_strided_attn and mask_attention cannot both be True unless mask_attention_final_layer is enabled"
+        )
 
     def num_queries(self, x) -> int:
         if self.dynamic_queries:
@@ -185,26 +197,48 @@ class MaskFormerDecoder(nn.Module):
         if self.posenc:
             x["query_posenc"], x["key_posenc"] = self.generate_positional_encodings(x)
 
-        attn_mask = None
-        attn_mask_transpose = None
+        local_attn_mask = None
+        local_attn_mask_transpose = None
+        q_sa_attn_mask = None
         if self.local_strided_attn:
             assert x["query_embed"].shape[0] == 1, "Local strided attention only supports batch size 1"
             if self.attn_type == "torch":
-                attn_mask = auto_local_ca_mask(x["query_embed"], x["key_embed"], self.window_size, wrap=self.window_wrap)
+                local_attn_mask = auto_local_ca_mask(x["query_embed"], x["key_embed"], self.window_size, wrap=self.window_wrap)
             elif self.attn_type == "flex":
                 device = x["query_embed"].device
                 q_len = x["query_embed"].shape[1]
                 kv_len = x["key_embed"].shape[1]
                 dtype_float = x["query_embed"].dtype
-                attn_mask = self.flex_local_ca_mask(q_len, kv_len, device, dtype_float)
-                attn_mask_transpose = transpose_blockmask(attn_mask, q_tokens=q_len, kv_tokens=kv_len, dev=device)
+                local_attn_mask = self.flex_local_ca_mask(q_len, kv_len, device, dtype_float)
+                local_attn_mask_transpose = transpose_blockmask(local_attn_mask, q_tokens=q_len, kv_tokens=kv_len, dev=device)
+            if self.q_sa_diag_window_size:
+                if self.attn_type == "torch":
+                    q_len = x["query_embed"].shape[1]
+                    q_sa_attn_mask = get_local_ca_mask(q_len, q_len, self.q_sa_diag_window_size, stride=1, device=x["query_embed"].device, wrap=self.window_wrap)
+                    q_sa_attn_mask = q_sa_attn_mask.unsqueeze(0)
+                elif self.attn_type == "flex":
+                    q_len = x["query_embed"].shape[1]
+                    device = x["query_embed"].device
+                    window_mask_func = sliding_window_mask_strided_wrapped if self.window_wrap else sliding_window_mask_strided
+                    q_sa_attn_mask = window_mask_func(
+                        self.q_sa_diag_window_size,
+                        stride=1,
+                        q_len=q_len,
+                        kv_len=q_len,
+                        device=str(device),
+                    )
 
         outputs: dict[str, dict] = {}
         for layer_index, decoder_layer in enumerate(self.decoder_layers):
             outputs[f"layer_{layer_index}"] = {}
+            attn_mask = None
+            attn_mask_transpose = None
+            use_mask_attention = self.mask_attention and (
+                not self.local_strided_attn or (self.mask_attention_final_layer and layer_index == len(self.decoder_layers) - 1)
+            )
 
             # if maskattention, PE should be added before generating the mask
-            if self.posenc and self.mask_attention:
+            if self.posenc and use_mask_attention:
                 x["query_embed"] = x["query_embed"] + x["query_posenc"]
                 x["key_embed"] = x["key_embed"] + x["key_posenc"]
 
@@ -242,7 +276,7 @@ class MaskFormerDecoder(nn.Module):
                         x["query_mask"] = query_mask
 
             # Construct the full attention mask for MaskAttention decoder
-            if attn_masks and self.mask_attention:
+            if attn_masks and use_mask_attention:
                 if self.unified_decoding:
                     # In merged input mode, tasks should return masks directly for the full merged tensor
                     # We expect only one mask key (likely "key" or similar) that covers all constituents
@@ -264,6 +298,19 @@ class MaskFormerDecoder(nn.Module):
                 # TODO: check and see see if this is really necessary
                 if self.unmask_all_false:
                     attn_mask = torch.where(torch.all(~attn_mask, dim=-1, keepdim=True), True, attn_mask)
+            elif self.local_strided_attn and not use_mask_attention:
+                attn_mask = local_attn_mask
+                attn_mask_transpose = local_attn_mask_transpose
+
+            if attn_mask is not None and self.attn_type == "flex" and not isinstance(attn_mask, BlockMask):
+                attn_mask = blockmask_from_attn_mask(attn_mask, block_size=self.block_size)
+                if self.requires_attn_mask_transpose and attn_mask_transpose is None:
+                    q_len = self.num_queries(x)
+                    kv_len = num_constituents
+                    attn_mask_transpose = transpose_blockmask(attn_mask, q_tokens=q_len, kv_tokens=kv_len, dev=x["key_embed"].device)
+
+            if q_sa_attn_mask is not None and self.attn_type == "flex" and not isinstance(q_sa_attn_mask, BlockMask):
+                q_sa_attn_mask = blockmask_from_attn_mask(q_sa_attn_mask, block_size=self.block_size)
 
             if (attn_mask is not None) and self.attn_type != "flex":
                 outputs[f"layer_{layer_index}"]["attn_mask"] = attn_mask
@@ -277,6 +324,7 @@ class MaskFormerDecoder(nn.Module):
                 query_posenc=x["query_posenc"] if self.posenc else None,
                 key_posenc=x["key_posenc"] if self.posenc else None,
                 attn_mask_transpose=attn_mask_transpose,
+                q_sa_attn_mask=q_sa_attn_mask,
             )
 
             # update the individual input constituent representations only if not in merged input mode
@@ -363,6 +411,7 @@ class MaskFormerDecoderLayer(nn.Module):
         query_posenc: Tensor | None = None,
         key_posenc: Tensor | None = None,
         attn_mask_transpose: Tensor | None = None,
+        q_sa_attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Forward pass for the decoder layer.
 
@@ -375,6 +424,7 @@ class MaskFormerDecoderLayer(nn.Module):
             query_posenc: Optional query positional encoding.
             key_posenc: Optional key positional encoding.
             attn_mask_transpose: Optional transposed attention mask.
+            q_sa_attn_mask: Optional attention mask for query self-attention.
 
         Returns:
             tuple[Tensor, Tensor]: A tuple containing:
@@ -387,7 +437,7 @@ class MaskFormerDecoderLayer(nn.Module):
         q = self.q_ca(q_pe, k=kv_pe, v=kv, attn_mask=attn_mask, q_mask=q_mask, kv_mask=kv_mask)
         q = self.q_dense(q)
 
-        q = self.q_sa(q, k=q, v=q, q_mask=q_mask)
+        q = self.q_sa(q, k=q, v=q, attn_mask=q_sa_attn_mask, q_mask=q_mask)
 
         # Update key/constituent embeddings with the query/object embeddings
         if self.bidirectional_ca:

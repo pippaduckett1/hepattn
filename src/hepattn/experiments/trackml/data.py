@@ -118,12 +118,15 @@ class TrackMLDataset(Dataset):
         num_particles = len(particles)
 
         # Build the input hits
+        feature_hits_map: dict[str, pd.DataFrame] = {}
         for feature, fields in self.inputs.items():
             # Determine per-feature hit subset
             if self.feature_volume_ids is not None and feature in self.feature_volume_ids:
                 feature_hits = hits[hits["volume_id"].isin(self.feature_volume_ids[feature])]
             else:
                 feature_hits = hits
+
+            feature_hits_map[feature] = feature_hits
 
             # Valid mask is all True for the feature-specific subset
             inputs[f"{feature}_valid"] = torch.full((len(feature_hits),), True).unsqueeze(0)
@@ -147,19 +150,25 @@ class TrackMLDataset(Dataset):
         # Create the mask targets
         selected_particle_ids = torch.from_numpy(particles["particle_id"].values)
         particle_ids = torch.cat([selected_particle_ids, torch.full((num_padding,), -999)])
-        hit_particle_ids = torch.from_numpy(hits["particle_id"].values)
-        targets["particle_hit_valid"] = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
+        for feature, feature_hits in feature_hits_map.items():
+            hit_particle_ids = torch.from_numpy(feature_hits["particle_id"].values)
+            targets[f"particle_{feature}_valid"] = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
 
         # Store particle and hit IDs for dynamic query selection
+        if "hit" in feature_hits_map:
+            hit_particle_ids = torch.from_numpy(feature_hits_map["hit"]["particle_id"].values)
+        else:
+            hit_particle_ids = torch.from_numpy(hits["particle_id"].values)
         targets["hit_particle_id"] = hit_particle_ids.unsqueeze(0)  # (1, N_hits)
         targets["particle_id"] = particle_ids.unsqueeze(0)  # (1, N_particles)
 
         # Create the hit filter targets (note this ignores the event_max_num_particles filtering)
         for target_feature, fields in self.targets.items():
+            target_hits = feature_hits_map.get(target_feature, hits)
             if "on_valid_particle" in fields:
-                targets[f"{target_feature}_on_valid_particle"] = torch.from_numpy(hits["on_valid_particle"].to_numpy()).unsqueeze(0)
+                targets[f"{target_feature}_on_valid_particle"] = torch.from_numpy(target_hits["on_valid_particle"].to_numpy()).unsqueeze(0)
             if "is_first" in fields:
-                targets[f"{target_feature}_is_first"] = torch.from_numpy(hits["is_first"].to_numpy()).unsqueeze(0)
+                targets[f"{target_feature}_is_first"] = torch.from_numpy(target_hits["is_first"].to_numpy()).unsqueeze(0)
 
         # Add sample ID
         targets["sample_id"] = torch.tensor([self.sample_ids[idx]], dtype=torch.int32)
@@ -287,14 +296,17 @@ class TrackMLDataset(Dataset):
         particle_ids = torch.arange(num_particles, dtype=torch.long)
         particle_ids = torch.cat([particle_ids, -999 * torch.ones(self.event_max_num_particles - num_particles)])
 
-        # Assign random particle IDs to hits
-        hit_particle_ids = torch.randint(0, num_particles, (num_hits,))
-
-        # Create the mask targets
-        targets["particle_hit_valid"] = (particle_ids.unsqueeze(-1) == hit_particle_ids.unsqueeze(-2)).unsqueeze(0)
+        # Assign random particle IDs to hits (per feature)
+        feature_hit_particle_ids: dict[str, torch.Tensor] = {}
+        for feature in self.inputs.keys():
+            feature_hit_particle_ids[feature] = torch.randint(0, num_particles, (num_hits,))
+            targets[f"particle_{feature}_valid"] = (particle_ids.unsqueeze(-1) == feature_hit_particle_ids[feature].unsqueeze(-2)).unsqueeze(0)
 
         # Store particle and hit IDs for dynamic query selection
-        targets["hit_particle_id"] = hit_particle_ids.unsqueeze(0)  # (1, N_hits)
+        if "hit" in feature_hit_particle_ids:
+            targets["hit_particle_id"] = feature_hit_particle_ids["hit"].unsqueeze(0)  # (1, N_hits)
+        else:
+            targets["hit_particle_id"] = torch.randint(0, num_particles, (num_hits,)).unsqueeze(0)
         targets["particle_id"] = particle_ids.unsqueeze(0)  # (1, N_particles)
 
         # Create the hit filter targets (random boolean)

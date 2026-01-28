@@ -1138,7 +1138,12 @@ class ClassificationTask(Task):
             )
 
         # Only consider valid targets - flatten both losses and mask
-        valid_mask = targets[f"{self.target_object}_valid"].view(-1)
+        valid_key = f"{self.target_object}_valid"
+        valid_mask = targets.get(valid_key)
+        if valid_mask is None:
+            valid_mask = torch.ones_like(losses, dtype=torch.bool)
+            targets[valid_key] = valid_mask
+        valid_mask = valid_mask.bool().view(-1)
         losses = losses.view(-1)[valid_mask]
         return {"bce": self.loss_weight * losses.mean()}
 

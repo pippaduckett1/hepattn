@@ -22,6 +22,7 @@ class MaskFormer(nn.Module):
         sorter: nn.Module | None = None,
         unified_decoding: bool = False,
         dynamic_query_source: str = "hit",
+        key_input_names: list[str] | None = None,
         encoder_tasks: nn.ModuleList | None = None,
     ):
         """Initializes the MaskFormer model, which is a modular transformer-style architecture designed
@@ -40,6 +41,7 @@ class MaskFormer(nn.Module):
             sorter: An optional sorter module used to reorder input constituents before processing.
             unified_decoding: If True, inputs remain merged for task processing instead of being unmerged after encoding.
             dynamic_query_source: Name of the input type to use as the source for dynamic query initialization (default: "hit").
+            key_input_names: Optional list of input names to include in encoder/decoder attention keys. Defaults to all inputs.
             encoder_tasks: Optional list of tasks to run after the encoder (before decoder). These tasks operate on post-encoder features.
         """
         super().__init__()
@@ -57,12 +59,17 @@ class MaskFormer(nn.Module):
         self.unified_decoding = unified_decoding
         self.decoder.unified_decoding = unified_decoding
         self.dynamic_query_source = dynamic_query_source
+        self.key_input_names = key_input_names or self.input_names
+
+        unknown_inputs = set(self.key_input_names) - set(self.input_names)
+        if unknown_inputs:
+            raise ValueError(f"key_input_names contains unknown inputs: {sorted(unknown_inputs)}")
 
         assert not (input_sort_field and sorter), "Cannot specify both input_sort_field and sorter."
         self.input_sort_field = input_sort_field
         self.sorter = sorter
         if self.sorter is not None:
-            self.sorter.input_names = self.input_names
+            self.sorter.input_names = self.key_input_names
 
         assert "key" not in self.input_names, "'key' input name is reserved."
         assert "query" not in self.input_names, "'query' input name is reserved."
@@ -174,20 +181,28 @@ class MaskFormer(nn.Module):
             x[input_name + "_r"] = inputs[input_name + "_r"]
 
             n_objects = x[input_name + "_embed"].shape[-2]
-            key_slices[input_name] = slice(key_start, key_start + n_objects)
-            key_start += n_objects
+            if input_name in self.key_input_names:
+                key_slices[input_name] = slice(key_start, key_start + n_objects)
+                key_start += n_objects
 
             # These slices can be used to pick out specific
             # objects after we have merged them all together
             # Only needed when not doing unified decoding
             if not self.unified_decoding:
                 device = inputs[input_name + "_valid"].device
-                mask = torch.cat([torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device) for i in self.input_names], dim=-1)
-                x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
+                if input_name in self.key_input_names:
+                    mask = torch.cat(
+                        [
+                            torch.full((inputs[i + "_valid"].shape[-1],), i == input_name, device=device)
+                            for i in self.key_input_names
+                        ],
+                        dim=-1,
+                    )
+                    x[f"key_is_{input_name}"] = mask.unsqueeze(0).expand(batch_size, -1)
 
         # Merge the input constituents and the padding mask into a single set
-        x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.input_names], dim=-2)
-        x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.input_names], dim=-1)
+        x["key_embed"] = torch.concatenate([x[input_name + "_embed"] for input_name in self.key_input_names], dim=-2)
+        x["key_valid"] = torch.concatenate([x[input_name + "_valid"] for input_name in self.key_input_names], dim=-1)
         # Preserve a non-None version for downstream logic that expects a tensor mask.
         x["key_valid_full"] = x["key_valid"]
 
@@ -199,15 +214,15 @@ class MaskFormer(nn.Module):
         # LEGACY. TODO: remove
         if self.input_sort_field and not self.sorter:
             x[f"key_{self.input_sort_field}"] = torch.concatenate(
-                [inputs[input_name + "_" + self.input_sort_field] for input_name in self.input_names], dim=-1
+                [inputs[input_name + "_" + self.input_sort_field] for input_name in self.key_input_names], dim=-1
             )
 
         # Dedicated sorting step before encoder
         if self.sorter is not None:
             x[f"key_{self.sorter.input_sort_field}"] = torch.concatenate(
-                [inputs[input_name + "_" + self.sorter.input_sort_field] for input_name in self.input_names], dim=-1
+                [inputs[input_name + "_" + self.sorter.input_sort_field] for input_name in self.key_input_names], dim=-1
             )
-            for input_name in self.input_names:
+            for input_name in self.key_input_names:
                 field = f"{input_name}_{self.sorter.input_sort_field}"
                 x[field] = inputs[field]
             x = self.sorter.sort_inputs(x)
@@ -229,7 +244,7 @@ class MaskFormer(nn.Module):
 
         # Unmerge the updated features back into the separate input types only if not doing unified decoding
         if not self.unified_decoding:
-            x = unmerge_inputs(x, self.input_names)
+            x = unmerge_inputs(x, self.key_input_names)
 
         # Run encoder tasks
         outputs = {"encoder": {}}
@@ -237,7 +252,7 @@ class MaskFormer(nn.Module):
             outputs["encoder"][task.name] = task(x)
 
         # Pass through decoder layers
-        x, decoder_outputs = self.decoder(x, self.input_names)
+        x, decoder_outputs = self.decoder(x, self.key_input_names)
         outputs.update(decoder_outputs)
 
         # Do any pooling if desired
