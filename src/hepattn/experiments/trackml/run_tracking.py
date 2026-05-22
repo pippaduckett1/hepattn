@@ -19,6 +19,30 @@ class TrackMLTracker(ModelWrapper):
     ):
         super().__init__(name, model, lrs_config, optimizer, mtl)
 
+    def _metric_targets(self, targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        metric_target_keys = (
+            "particle_valid",
+            "particle_hit_valid",
+            "hit_on_valid_particle",
+            "hit_is_first",
+            "hit_is_last",
+            "key_on_valid_particle",
+            "key_is_first",
+            "key_is_last",
+        )
+        if not any(f"{key}_eval" in targets for key in metric_target_keys):
+            return targets
+
+        metric_targets = dict(targets)
+        for key in metric_target_keys:
+            eval_key = f"{key}_eval"
+            if eval_key in targets:
+                metric_targets[key] = targets[eval_key]
+        return metric_targets
+
+    def log_metrics(self, preds: dict[str, Tensor], targets: dict[str, Tensor], stage: str) -> None:
+        super().log_metrics(preds, self._metric_targets(targets), stage)
+
     def log_custom_metrics(self, preds, targets, stage):
         query_mask = targets.get("query_mask")
         if query_mask is not None:
@@ -128,6 +152,42 @@ class TrackMLTracker(ModelWrapper):
         self.log(f"{stage}/num_hits_valid", num_hits_valid, sync_dist=True)
         self.log(f"{stage}/num_hits_noise", num_hits_noise, sync_dist=True)
 
+    def _augment_test_targets_with_event_counts(
+        self,
+        outputs: dict[str, dict[str, Tensor]],
+        targets: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        """Attach per-event query and truth-particle counts for eval-file analysis."""
+        augmented_targets = dict(targets)
+
+        query_mask = outputs.get("encoder", {}).get("query_mask")
+        if query_mask is not None:
+            num_initialized_queries = query_mask.to(dtype=torch.int64).sum(dim=-1)
+        else:
+            decoder = getattr(self.model, "decoder", None)
+            static_num_queries = getattr(decoder, "_num_queries", None)
+            if static_num_queries is None:
+                batch_size = targets["particle_valid"].shape[0]
+                num_initialized_queries = torch.zeros(batch_size, dtype=torch.int64, device=targets["particle_valid"].device)
+            else:
+                batch_size = targets["particle_valid"].shape[0]
+                num_initialized_queries = torch.full(
+                    (batch_size,),
+                    int(static_num_queries),
+                    dtype=torch.int64,
+                    device=targets["particle_valid"].device,
+                )
+
+        num_reconstructable_particles = targets["particle_valid"].to(dtype=torch.int64).sum(dim=-1)
+
+        augmented_targets["num_initialized_queries"] = num_initialized_queries
+        augmented_targets["num_reconstructable_particles"] = num_reconstructable_particles
+        particle_valid_train = targets.get("particle_valid_train")
+        if particle_valid_train is not None:
+            augmented_targets["num_reconstructable_particles_train"] = particle_valid_train.to(dtype=torch.int64).sum(dim=-1)
+            augmented_targets["num_reconstructable_particles_eval"] = num_reconstructable_particles
+        return augmented_targets
+
     def test_step(
         self, batch: tuple[dict[str, Tensor], dict[str, Tensor]]
     ) -> tuple[dict[str, Tensor], dict[str, Tensor], dict[str, Tensor], dict[str, Tensor]]:
@@ -140,6 +200,8 @@ class TrackMLTracker(ModelWrapper):
         outputs = self.model(inputs)
         outputs, targets, losses = self.model.loss(outputs, targets)
         preds = self.model.predict(outputs)
+        targets = self._metric_targets(targets)
+        targets = self._augment_test_targets_with_event_counts(outputs=outputs, targets=targets)
         return outputs, preds, losses, targets
 
 
