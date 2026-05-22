@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 
 HIT_COORDINATE_SCALE = 0.01
 
+HIT_COORDINATE_SCALE = 0.01
+
 
 def is_valid_file(path):
     path = Path(path)
