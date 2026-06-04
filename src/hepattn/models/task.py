@@ -644,14 +644,7 @@ class IoUPredictionTask(Task):
         dim: int,
         loss_weight: float = 1.0,
         input_constituent: str | None = None,
-        target_object: str | None = None,
         target_field: str = "valid",
-        loss: Literal["mse", "huber"] = "mse",
-        huber_delta: float = 0.1,
-        target_mode: Literal["soft", "hard"] = "soft",
-        target_threshold: float = 0.5,
-        valid_target_weight: float = 1.0,
-        null_target_weight: float = 1.0,
     ):
         """Task for predicting IoU of mask predictions.
 
@@ -669,14 +662,7 @@ class IoUPredictionTask(Task):
             dim: Embedding dimension.
             loss_weight: Weight for the IoU MSE loss.
             input_constituent: Name of the constituent type (e.g., "hit"), used for validity masking. If None, inferred from mask_logit_key.
-            target_object: Name of the target object used for validity weighting. If None, inferred from target_mask_key.
             target_field: Target field name (default: "valid").
-            loss: Regression loss for the IoU head.
-            huber_delta: Delta parameter for Huber loss.
-            target_mode: Whether to build the IoU target from soft probabilities or thresholded hard masks.
-            target_threshold: Threshold used when ``target_mode="hard"``.
-            valid_target_weight: Per-slot loss weight for matched real targets.
-            null_target_weight: Per-slot loss weight for padded/null targets.
 
         Raises:
             ValueError: If input_constituent cannot be inferred from mask_logit_key when not provided explicitly.
@@ -691,12 +677,6 @@ class IoUPredictionTask(Task):
         self.target_field = target_field
         self.loss_weight = loss_weight
         self.dim = dim
-        self.loss_name = loss
-        self.huber_delta = huber_delta
-        self.target_mode = target_mode
-        self.target_threshold = target_threshold
-        self.valid_target_weight = valid_target_weight
-        self.null_target_weight = null_target_weight
 
         # Infer input_constituent from mask_logit_key if not provided
         if input_constituent is None:
@@ -708,27 +688,6 @@ class IoUPredictionTask(Task):
                 raise ValueError(f"Cannot infer input_constituent from mask_logit_key '{mask_logit_key}'. Please provide it explicitly.")
         else:
             self.input_constituent = input_constituent
-
-        # Infer target_object from target_mask_key if not provided
-        if target_object is None:
-            parts = target_mask_key.rsplit("_", maxsplit=1)
-            if len(parts) != 2:
-                raise ValueError(f"Cannot infer target_object from target_mask_key '{target_mask_key}'. Please provide it explicitly.")
-            self.target_object = parts[0]
-        else:
-            self.target_object = target_object
-
-        if self.loss_name not in {"mse", "huber"}:
-            raise ValueError(f"Unknown IoU loss '{self.loss_name}'. Expected one of ['mse', 'huber'].")
-        if self.target_mode not in {"soft", "hard"}:
-            raise ValueError(f"Unknown IoU target_mode '{self.target_mode}'. Expected one of ['soft', 'hard'].")
-        if self.huber_delta <= 0:
-            raise ValueError(f"huber_delta must be > 0, got {self.huber_delta}")
-        if self.valid_target_weight < 0 or self.null_target_weight < 0:
-            raise ValueError(
-                "valid_target_weight and null_target_weight must be non-negative, "
-                f"got {self.valid_target_weight} and {self.null_target_weight}."
-            )
 
         # Network to predict IoU from object embeddings
         self.iou_net = Dense(dim, 1)
@@ -766,25 +725,6 @@ class IoUPredictionTask(Task):
         # Avoid division by zero
         return intersection / (union + 1e-6)
 
-    def _build_iou_target(self, mask_logits: Tensor, target: Tensor) -> Tensor:
-        if self.target_mode == "soft":
-            pred_mask = mask_logits.sigmoid()
-        else:
-            pred_mask = (mask_logits.sigmoid() >= self.target_threshold).type_as(mask_logits)
-        return self.calculate_iou(pred_mask, target)
-
-    def _reduce_iou_loss(self, iou_pred: Tensor, iou_target: Tensor, sample_weight: Tensor | None = None) -> Tensor:
-        if self.loss_name == "mse":
-            loss = torch.square(iou_pred - iou_target)
-        else:
-            loss = torch.nn.functional.huber_loss(iou_pred, iou_target, delta=self.huber_delta, reduction="none")
-
-        if sample_weight is None:
-            return loss.mean()
-
-        weight_sum = sample_weight.sum().clamp_min(1e-6)
-        return (loss * sample_weight).sum() / weight_sum
-
     def loss(
         self,
         outputs: dict[str, Tensor],
@@ -803,35 +743,234 @@ class IoUPredictionTask(Task):
             )
 
         mask_logits = mask_task_outputs[self.mask_logit_key]
+        pred_probs = mask_logits.sigmoid()
 
         # Get target mask
         target = targets[self.target_mask_key + "_" + self.target_field].type_as(mask_logits)
 
         # Calculate the actual IoU between predicted and target masks
-        iou_target = self._build_iou_target(mask_logits, target)
+        iou_target = self.calculate_iou(pred_probs, target)
 
         # Get the predicted IoU
         iou_pred = outputs[self.input_object + "_iou_logit"].sigmoid()
 
-        target_valid = targets.get(self.target_object + "_valid")
+        # Only compute loss for valid objects, combined with query_mask if present
+        object_pad = targets.get(self.input_object + "_valid")
         query_mask = targets.get("query_mask")
-
-        sample_weight = None
-        if target_valid is not None:
-            sample_weight = torch.full_like(iou_pred, self.null_target_weight)
-            sample_weight[target_valid] = self.valid_target_weight
-
-        if query_mask is not None:
+        if object_pad is not None:
+            valid_mask = object_pad
+            if query_mask is not None:
+                valid_mask = valid_mask & query_mask
+            iou_target = iou_target[valid_mask]
+            iou_pred = iou_pred[valid_mask]
+        elif query_mask is not None:
             iou_target = iou_target[query_mask]
             iou_pred = iou_pred[query_mask]
-            if sample_weight is not None:
-                sample_weight = sample_weight[query_mask]
 
-        if iou_pred.numel() == 0:
-            return {f"iou_{self.loss_name}": iou_pred.new_zeros(())}
+        # Compute MSE loss
+        iou_loss = torch.nn.functional.mse_loss(iou_pred, iou_target.detach())
+        return {"iou_mse": self.loss_weight * iou_loss}
 
-        iou_loss = self._reduce_iou_loss(iou_pred, iou_target.detach(), sample_weight=sample_weight)
-        return {f"iou_{self.loss_name}": self.loss_weight * iou_loss}
+
+# class IoUPredictionTask(Task):
+#     def __init__(
+#         self,
+#         name: str,
+#         input_object: str,
+#         mask_task_name: str,
+#         mask_logit_key: str,
+#         target_mask_key: str,
+#         dim: int,
+#         loss_weight: float = 1.0,
+#         input_constituent: str | None = None,
+#         target_object: str | None = None,
+#         target_field: str = "valid",
+#         loss: Literal["mse", "huber"] = "mse",
+#         huber_delta: float = 0.1,
+#         target_mode: Literal["soft", "hard"] = "soft",
+#         target_threshold: float = 0.5,
+#         valid_target_weight: float = 1.0,
+#         null_target_weight: float = 1.0,
+#     ):
+#         """Task for predicting IoU of mask predictions.
+
+#         This task computes the IoU between predicted and target masks, and trains
+#         a network to predict this IoU value. It only runs on the final decoder layer
+#         (has_intermediate_loss=False) to avoid computational overhead during intermediate
+#         decoder layers.
+
+#         Args:
+#             name: Name of the task.
+#             input_object: Name of the input object (e.g., "particle").
+#             mask_task_name: Name of the task that produces mask logits (e.g., "track_hit_valid").
+#             mask_logit_key: Key to read mask logits from the mask task's outputs (e.g., "track_hit_logit").
+#             target_mask_key: Base key for target mask (e.g., "particle_hit"), will be combined with target_field.
+#             dim: Embedding dimension.
+#             loss_weight: Weight for the IoU MSE loss.
+#             input_constituent: Name of the constituent type (e.g., "hit"), used for validity masking. If None, inferred from mask_logit_key.
+#             target_object: Name of the target object used for validity weighting. If None, inferred from target_mask_key.
+#             target_field: Target field name (default: "valid").
+#             loss: Regression loss for the IoU head.
+#             huber_delta: Delta parameter for Huber loss.
+#             target_mode: Whether to build the IoU target from soft probabilities or thresholded hard masks.
+#             target_threshold: Threshold used when ``target_mode="hard"``.
+#             valid_target_weight: Per-slot loss weight for matched real targets.
+#             null_target_weight: Per-slot loss weight for padded/null targets.
+
+#         Raises:
+#             ValueError: If input_constituent cannot be inferred from mask_logit_key when not provided explicitly.
+#         """
+#         super().__init__(has_intermediate_loss=False)
+
+#         self.name = name
+#         self.input_object = input_object
+#         self.mask_task_name = mask_task_name
+#         self.mask_logit_key = mask_logit_key
+#         self.target_mask_key = target_mask_key
+#         self.target_field = target_field
+#         self.loss_weight = loss_weight
+#         self.dim = dim
+#         self.loss_name = loss
+#         self.huber_delta = huber_delta
+#         self.target_mode = target_mode
+#         self.target_threshold = target_threshold
+#         self.valid_target_weight = valid_target_weight
+#         self.null_target_weight = null_target_weight
+
+#         # Infer input_constituent from mask_logit_key if not provided
+#         if input_constituent is None:
+#             # Extract constituent name from mask_logit_key (e.g., "particle_hit_logit" -> "hit")
+#             parts = mask_logit_key.replace("_logit", "").split("_")
+#             if len(parts) >= 2:
+#                 self.input_constituent = parts[-1]
+#             else:
+#                 raise ValueError(f"Cannot infer input_constituent from mask_logit_key '{mask_logit_key}'. Please provide it explicitly.")
+#         else:
+#             self.input_constituent = input_constituent
+
+#         # Infer target_object from target_mask_key if not provided
+#         if target_object is None:
+#             parts = target_mask_key.rsplit("_", maxsplit=1)
+#             if len(parts) != 2:
+#                 raise ValueError(f"Cannot infer target_object from target_mask_key '{target_mask_key}'. Please provide it explicitly.")
+#             self.target_object = parts[0]
+#         else:
+#             self.target_object = target_object
+
+#         if self.loss_name not in {"mse", "huber"}:
+#             raise ValueError(f"Unknown IoU loss '{self.loss_name}'. Expected one of ['mse', 'huber'].")
+#         if self.target_mode not in {"soft", "hard"}:
+#             raise ValueError(f"Unknown IoU target_mode '{self.target_mode}'. Expected one of ['soft', 'hard'].")
+#         if self.huber_delta <= 0:
+#             raise ValueError(f"huber_delta must be > 0, got {self.huber_delta}")
+#         if self.valid_target_weight < 0 or self.null_target_weight < 0:
+#             raise ValueError(
+#                 "valid_target_weight and null_target_weight must be non-negative, "
+#                 f"got {self.valid_target_weight} and {self.null_target_weight}."
+#             )
+
+#         # Network to predict IoU from object embeddings
+#         self.iou_net = Dense(dim, 1)
+
+#         self.inputs = [input_object + "_embed"]
+#         self.outputs = [input_object + "_iou_logit"]
+
+#     def forward(self, x: dict[str, Tensor], outputs: dict[str, dict[str, Tensor]] | None = None) -> dict[str, Tensor]:
+#         # Predict IoU from object embeddings
+#         iou_logit = self.iou_net(x[self.input_object + "_embed"]).squeeze(-1)
+#         return {self.input_object + "_iou_logit": iou_logit}
+
+#     def predict(self, outputs: dict[str, Tensor], query_mask: Tensor | None = None) -> dict[str, Tensor]:
+#         iou = outputs[self.input_object + "_iou_logit"].detach().sigmoid()
+
+#         # Apply query_mask to set padded query IoU to 0
+#         if query_mask is not None:
+#             iou = iou * query_mask.float()
+
+#         return {self.input_object + "_iou": iou}
+
+#     def calculate_iou(self, pred_probs: Tensor, target: Tensor) -> Tensor:
+#         """Calculate IoU between predicted probabilities and target mask.
+
+#         Args:
+#             pred_probs: Predicted probabilities (B, N, M)
+#             target: Target mask (B, N, M)
+
+#         Returns:
+#             IoU values (B, N)
+#         """
+#         intersection = (pred_probs * target).sum(dim=-1)
+#         union = pred_probs.sum(dim=-1) + target.sum(dim=-1) - intersection
+
+#         # Avoid division by zero
+#         return intersection / (union + 1e-6)
+
+#     def _build_iou_target(self, mask_logits: Tensor, target: Tensor) -> Tensor:
+#         if self.target_mode == "soft":
+#             pred_mask = mask_logits.sigmoid()
+#         else:
+#             pred_mask = (mask_logits.sigmoid() >= self.target_threshold).type_as(mask_logits)
+#         return self.calculate_iou(pred_mask, target)
+
+#     def _reduce_iou_loss(self, iou_pred: Tensor, iou_target: Tensor, sample_weight: Tensor | None = None) -> Tensor:
+#         if self.loss_name == "mse":
+#             loss = torch.square(iou_pred - iou_target)
+#         else:
+#             loss = torch.nn.functional.huber_loss(iou_pred, iou_target, delta=self.huber_delta, reduction="none")
+
+#         if sample_weight is None:
+#             return loss.mean()
+
+#         weight_sum = sample_weight.sum().clamp_min(1e-6)
+#         return (loss * sample_weight).sum() / weight_sum
+
+#     def loss(
+#         self,
+#         outputs: dict[str, Tensor],
+#         targets: dict[str, Tensor],
+#         layer_outputs: dict[str, dict[str, Tensor]] | None = None,
+#     ) -> dict[str, Tensor]:
+#         # Read mask logits directly from the mask task's outputs (already permuted by Hungarian matching)
+#         if layer_outputs is None or self.mask_task_name not in layer_outputs:
+#             raise ValueError(f"Mask task '{self.mask_task_name}' not found in layer_outputs. Make sure the mask task runs before IoUPredictionTask.")
+
+#         mask_task_outputs = layer_outputs[self.mask_task_name]
+#         if self.mask_logit_key not in mask_task_outputs:
+#             raise ValueError(
+#                 f"Mask logits key '{self.mask_logit_key}' not found in task '{self.mask_task_name}' outputs. "
+#                 f"Available keys: {list(mask_task_outputs.keys())}"
+#             )
+
+#         mask_logits = mask_task_outputs[self.mask_logit_key]
+
+#         # Get target mask
+#         target = targets[self.target_mask_key + "_" + self.target_field].type_as(mask_logits)
+
+#         # Calculate the actual IoU between predicted and target masks
+#         iou_target = self._build_iou_target(mask_logits, target)
+
+#         # Get the predicted IoU
+#         iou_pred = outputs[self.input_object + "_iou_logit"].sigmoid()
+
+#         target_valid = targets.get(self.target_object + "_valid")
+#         query_mask = targets.get("query_mask")
+
+#         sample_weight = None
+#         if target_valid is not None:
+#             sample_weight = torch.full_like(iou_pred, self.null_target_weight)
+#             sample_weight[target_valid] = self.valid_target_weight
+
+#         if query_mask is not None:
+#             iou_target = iou_target[query_mask]
+#             iou_pred = iou_pred[query_mask]
+#             if sample_weight is not None:
+#                 sample_weight = sample_weight[query_mask]
+
+#         if iou_pred.numel() == 0:
+#             return {f"iou_{self.loss_name}": iou_pred.new_zeros(())}
+
+#         iou_loss = self._reduce_iou_loss(iou_pred, iou_target.detach(), sample_weight=sample_weight)
+#         return {f"iou_{self.loss_name}": self.loss_weight * iou_loss}
 
 
 class HitCountPredictionTask(Task):
