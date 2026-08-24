@@ -11,32 +11,18 @@ from hepattn.utils.cuda_timer import cuda_timer
 class InferenceTimer(Callback):
     def __init__(self):
         super().__init__()
-        self.warmup_full_test_set_passes = 0
-        self.n_warm_start = 20
-        self._completed_warmup_passes = 0
-        self._is_warmup_pass = False
         self.times = []
         self.dims = []
         self.query_counts = []
+        self.n_warm_start = 20
         self._tmp_dims = None
         self._wrapped_module = None
 
         self.peak_allocated = []
         self.peak_reserved = []
 
-    def _reset_measurements(self):
-        self.times = []
-        self.dims = []
-        self.query_counts = []
-        self.peak_allocated = []
-        self.peak_reserved = []
-        self._tmp_dims = None
-
     def on_test_start(self, trainer, pl_module):
         assert trainer.global_rank == 0, "InferenceTimer should only be used with a single process."
-        self._reset_measurements()
-        self._is_warmup_pass = self._completed_warmup_passes < self.warmup_full_test_set_passes
-
         model = pl_module
         if hasattr(model, "model"):
             model = model.model
@@ -53,18 +39,17 @@ class InferenceTimer(Callback):
         def new_forward(*args, **kwargs):
             self._tmp_dims = args[0]["hit_valid"].shape[-1]
 
-            if self._cuda and not self._is_warmup_pass:
+            if self._cuda:
                 # Reset peak counters so "max_*" corresponds to this forward pass
                 torch.cuda.synchronize(self._device)
                 torch.cuda.reset_peak_memory_stats(self._device)
                 base_alloc = torch.cuda.memory_allocated(self._device)
                 base_rsvd = torch.cuda.memory_reserved(self._device)
 
-            timer_bucket = self.times if not self._is_warmup_pass else []
-            with cuda_timer(timer_bucket):
+            with cuda_timer(self.times):
                 out = self.old_forward(*args, **kwargs)
 
-            if self._cuda and not self._is_warmup_pass:
+            if self._cuda:
                 # Make sure kernels are done before reading stats
                 torch.cuda.synchronize(self._device)
                 peak_alloc = torch.cuda.max_memory_allocated(self._device) - base_alloc
@@ -102,10 +87,6 @@ class InferenceTimer(Callback):
         return int(static_num_queries)
 
     def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self._is_warmup_pass:
-            self._tmp_dims = None
-            return
-
         if self._tmp_dims is not None:
             self.dims.append(self._tmp_dims)
             self._tmp_dims = None
@@ -117,14 +98,6 @@ class InferenceTimer(Callback):
     def on_test_end(self, trainer, pl_module):
         if self._wrapped_module is not None:
             self._wrapped_module.forward = self.old_forward
-
-        if self._is_warmup_pass:
-            self._completed_warmup_passes += 1
-            print(
-                f"InferenceTimer warm-up pass {self._completed_warmup_passes}/{self.warmup_full_test_set_passes} "
-                "completed. Run `trainer.test(...)` again to record timings."
-            )
-            return
 
         if not len(self.times):
             raise ValueError("No times recorded.")
