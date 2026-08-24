@@ -1,11 +1,6 @@
 import torch
 from torch import Tensor, nn
 
-SPECIAL_TARGET_INPUT_NAMES = {
-    "paper_truth_particle_id": "hit",
-    "paper_truth_weight": "hit",
-}
-
 
 class Sorter(nn.Module):
     def __init__(self, input_sort_field: str) -> None:
@@ -65,8 +60,7 @@ class Sorter(nn.Module):
             sort_idx = torch.argsort(sort_fields[f"{input_name}_{self.input_sort_field}"], dim=-1)
 
             for key, x in targets.items():
-                special_input_name = SPECIAL_TARGET_INPUT_NAMES.get(key)
-                if x is None or (not self._key_has_input_token(key, input_name) and special_input_name != input_name):
+                if x is None or not self._key_has_input_token(key, input_name):
                     continue
 
                 # sort target mask

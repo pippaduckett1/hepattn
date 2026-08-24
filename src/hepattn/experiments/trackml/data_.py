@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 
 HIT_COORDINATE_SCALE = 0.01
 
+HIT_COORDINATE_SCALE = 0.01
+
 
 def is_valid_file(path):
     path = Path(path)
@@ -50,14 +52,20 @@ class TrackMLDataset(Dataset):
         self.train_particle_min_pt = float(particle_train_min_pt if particle_train_min_pt is not None else particle_min_pt)
         self.particle_max_abs_eta = float(particle_max_abs_eta)
         self.eval_particle_min_num_hits = int(particle_min_num_hits)
-        self.train_particle_min_num_hits = int(particle_train_min_num_hits if particle_train_min_num_hits is not None else particle_min_num_hits)
+        self.train_particle_min_num_hits = int(
+            particle_train_min_num_hits if particle_train_min_num_hits is not None else particle_min_num_hits
+        )
         self.include_paper_eval_targets = bool(include_paper_eval_targets)
         self.has_distinct_training_particle_cuts = (
-            self.train_particle_min_pt != self.eval_particle_min_pt or self.train_particle_min_num_hits != self.eval_particle_min_num_hits
+            self.train_particle_min_pt != self.eval_particle_min_pt
+            or self.train_particle_min_num_hits != self.eval_particle_min_num_hits
         )
 
         if self.train_particle_min_pt > self.eval_particle_min_pt:
-            msg = "particle_train_min_pt must be less than or equal to particle_min_pt so the training truth remains a superset of the eval truth."
+            msg = (
+                "particle_train_min_pt must be less than or equal to particle_min_pt so the "
+                "training truth remains a superset of the eval truth."
+            )
             raise ValueError(msg)
         if self.train_particle_min_num_hits > self.eval_particle_min_num_hits:
             msg = (
@@ -193,10 +201,12 @@ class TrackMLDataset(Dataset):
         num_padding = self.event_max_num_particles - num_particles
         targets["particle_valid"] = torch.cat([torch.full((num_particles,), True), torch.full((num_padding,), False)]).unsqueeze(0)
         if self.has_distinct_training_particle_cuts:
-            eval_particle_valid = torch.cat([
-                torch.from_numpy(particles["is_eval_particle"].to_numpy(copy=True)),
-                torch.full((num_padding,), False),
-            ]).unsqueeze(0)
+            eval_particle_valid = torch.cat(
+                [
+                    torch.from_numpy(particles["is_eval_particle"].to_numpy(copy=True)),
+                    torch.full((num_padding,), False),
+                ]
+            ).unsqueeze(0)
             self._swap_target_view(targets, "particle_valid", eval_particle_valid)
 
         # Create the mask targets
@@ -297,9 +307,6 @@ class TrackMLDataset(Dataset):
                 hits = hits[hit_filter_pred]
 
         # TODO: Add back truth based hit filtering
-        if "weight" not in hits.columns:
-            hits = hits.copy()
-            hits["weight"] = np.ones(len(hits), dtype=np.float32)
         truth = hits[["hit_id", "particle_id", "weight"]].copy()
 
         counts = hits["particle_id"].value_counts()
@@ -476,7 +483,7 @@ class TrackMLDataModule(LightningDataModule):
         hit_eval_train: str | None = None,
         hit_eval_val: str | None = None,
         hit_eval_test: str | None = None,
-        paper_compatible_test_output: bool = True,
+        paper_compatible_test_output: bool = False,
         **kwargs,
     ):
         super().__init__()
