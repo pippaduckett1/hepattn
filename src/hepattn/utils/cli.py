@@ -89,9 +89,16 @@ class CLI(LightningCLI):
             # Modify callbacks when testing
             self.save_config_callback = None
             sc["trainer.logger"] = False
+            callbacks = []
+            progress_bar_enabled = bool(sc.get("trainer.enable_progress_bar", True))
             for c in sc["trainer.callbacks"]:
+                class_path = getattr(c, "class_path", "")
+                if (not progress_bar_enabled) and class_path == "lightning.pytorch.callbacks.TQDMProgressBar":
+                    continue
                 if hasattr(c, "init_args") and hasattr(c.init_args, "refresh_rate"):
                     c.init_args.refresh_rate = 1
+                callbacks.append(c)
+            sc["trainer.callbacks"] = callbacks
 
             # Use the best epoch for testing
             if sc["ckpt_path"] is None:

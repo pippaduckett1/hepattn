@@ -550,3 +550,14 @@ class TrackMLDataModule(LightningDataModule):
 
     def test_dataloader(self):
         return self.get_dataloader(dataset=self.test_dataset, stage="test", shuffle=False)
+
+    def benchmark_test_dataloader(self, indices: list[int]) -> DataLoader:
+        """Build a deterministic test loader for one timing-benchmark sweep."""
+        return DataLoader(
+            dataset=self.test_dataset,
+            batch_size=None,
+            collate_fn=None,
+            sampler=indices,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )

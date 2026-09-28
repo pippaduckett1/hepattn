@@ -99,6 +99,11 @@ trainer:
     #   init_args:
     #     log_every_n_batches: 100
     - class_path: hepattn.callbacks.InferenceTimer
+      init_args:
+        repeats_per_batch: 20
+        warmup_repeats_per_batch: 15
+        warmup_full_test_set_passes: 1
+        summary_stat: median
     - class_path: hepattn.callbacks.MemoryStats
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint

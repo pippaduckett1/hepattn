@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=dq-v8
+#SBATCH --job-name=dq-v8-log-mask
 #SBATCH -p GPU
 #SBATCH --nodes=1
 #SBATCH --export=ALL
@@ -39,8 +39,8 @@ nvidia-smi
 echo "Running training script..."
 
 # Python command that will be run
-# config=/share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/configs/tracking-sort-lca.yaml
-config=/share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/configs/tracking.yaml
+config=/share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/configs/tracking-eta4-nq-4000-log-mask.yaml
+# config=/share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/configs/tracking-eta4-nq-4000-pt900-log-mask.yaml
 PYTORCH_CMD="python run_tracking.py fit --config $config --trainer.devices 1"
 # PYTORCH_CMD="python run_tracking.py test --config $config --trainer.devices 1"
 
