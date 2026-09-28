@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK-v8-eta4-pt600-epochs30
+name: TRK-v8-eta4-lca-epochs30
 data:
   # isambard
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -10,7 +10,7 @@ data:
   hit_eval_val: /share/rcif2/pduckett/hepattn-dq/HF-pix-600MeV-eta4_20260214-T195401/epoch=070-val_loss=0.20153_val_eval.h5
   hit_eval_test: /share/rcif2/pduckett/hepattn-dq/HF-pix-600MeV-eta4_20260214-T195401/epoch=070-val_loss=0.20153_test_eval.h5
   hit_filter_threshold: 0.1
-  
+
   num_workers: 10
   num_train: -1
   num_test: -1
@@ -31,7 +31,7 @@ data:
   particle_min_num_hits: 3
 
   # Maximum number of reconstructable particles allowed in an event
-  event_max_num_particles: &num_objects 4000
+  event_max_num_particles: &num_objects 3800
   strict_max_objects: false
 
   # Define which inputs will be available to the model
@@ -73,7 +73,7 @@ trainer:
   devices: 1
   precision: bf16-mixed
   log_every_n_steps: 50
-  default_root_dir: ./logs/
+  default_root_dir: /share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/logs/
   gradient_clip_val: 0.1
   enable_progress_bar: true
 
@@ -91,19 +91,14 @@ trainer:
       project: trackml_tracking
 
   callbacks:
-    # - class_path: hepattn.callbacks.AttnMaskLogger
-    #   init_args:
-    #     log_every_n_batches: 100
     - class_path: hepattn.callbacks.Compile
       init_args:
         skip_dynamic_cudagraphs: true
         #mode: max-autotune # use for fastest inference
+    # - class_path: hepattn.callbacks.AttnMaskLogger
+    #   init_args:
+    #     log_every_n_batches: 100
     - class_path: hepattn.callbacks.InferenceTimer
-      init_args:
-        repeats_per_batch: 20
-        warmup_repeats_per_batch: 0
-        warmup_full_test_set_passes: 1
-        summary_stat: median
     - class_path: hepattn.callbacks.MemoryStats
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint
@@ -140,7 +135,10 @@ model:
     class_path: hepattn.models.MaskFormer
     init_args:
       dim: &dim 256
-      input_sort_field: phi
+      sorter:
+        class_path: hepattn.utils.sorter.Sorter
+        init_args:
+          input_sort_field: phi
       input_nets:
         class_path: torch.nn.ModuleList
         init_args:
@@ -200,16 +198,18 @@ model:
         dynamic_query_source: hit
         num_decoder_layers: &num_dec_layers 3
         num_queries: *num_objects
-        mask_attention: true
+        mask_attention: false
+        local_strided_attn: true
+        window_size: 128
+        window_wrap: true
+        block_size: 16
         use_query_masks: false
-        debug: false
-        unmask_all_false: true
+        unmask_all_false: false
         decoder_layer_config:
           dim: *dim
           norm: CustomLayerNorm
           hybrid_norm: true
-          dense_kwargs: {activation: SwiGLU}
-          attn_kwargs: {bias: false}
+          attn_kwargs: {bias: false, attn_type: flex}
           bidirectional_ca: false
 
       encoder_tasks:
@@ -230,7 +230,6 @@ model:
                     input_size: *dim
                     hidden_layers: [256]
                     output_size: 1
-
       tasks:
         class_path: torch.nn.ModuleList
         init_args:

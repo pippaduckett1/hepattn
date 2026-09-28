@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK-v8-eta4-pt600-epochs30
+name: TRK-v8-eta4-pt600-epochs10-measure-mem
 data:
   # isambard
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -68,12 +68,12 @@ data:
 
 trainer:
   # Training stuff here
-  max_epochs: 30
+  max_epochs: 2
   accelerator: gpu
   devices: 1
   precision: bf16-mixed
   log_every_n_steps: 50
-  default_root_dir: ./logs/
+  default_root_dir: /share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/logs/
   gradient_clip_val: 0.1
   enable_progress_bar: true
 
@@ -99,11 +99,6 @@ trainer:
         skip_dynamic_cudagraphs: true
         #mode: max-autotune # use for fastest inference
     - class_path: hepattn.callbacks.InferenceTimer
-      init_args:
-        repeats_per_batch: 20
-        warmup_repeats_per_batch: 0
-        warmup_full_test_set_passes: 1
-        summary_stat: median
     - class_path: hepattn.callbacks.MemoryStats
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint
@@ -202,6 +197,7 @@ model:
         num_queries: *num_objects
         mask_attention: true
         use_query_masks: false
+        unmask_all_false: false
         debug: false
         unmask_all_false: true
         decoder_layer_config:

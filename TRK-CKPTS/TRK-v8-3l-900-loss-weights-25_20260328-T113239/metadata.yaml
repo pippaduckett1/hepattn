@@ -1,0 +1,15 @@
+num_train: 8543
+num_val: 100
+batch_size: null
+trainable_params: 8668931
+num_gpus: 1
+gpu_ids:
+- 0
+num_workers: 10
+torch_version: 2.9.1+cu128
+lightning_version: 2.5.2
+cuda_version: '12.8'
+hostname: compute-gpu-0-3.local
+out_dir: /share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/logs/TRK-v8-3l-900-loss-weights-25_20260328-T113239
+log_url: https://www.comet.com/pduckett/trackml-tracking/cb11be463d3d488985bba7d7cecc6446
+slurm_job_id: SLURM_1281140

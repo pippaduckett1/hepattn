@@ -73,7 +73,7 @@ trainer:
   devices: 1
   precision: bf16-mixed
   log_every_n_steps: 50
-  default_root_dir: ./logs/
+  default_root_dir: /share/rcif2/pduckett/hepattn-dq/logs/
   gradient_clip_val: 0.1
   enable_progress_bar: true
 
@@ -99,11 +99,6 @@ trainer:
         skip_dynamic_cudagraphs: true
         #mode: max-autotune # use for fastest inference
     - class_path: hepattn.callbacks.InferenceTimer
-      init_args:
-        repeats_per_batch: 20
-        warmup_repeats_per_batch: 0
-        warmup_full_test_set_passes: 1
-        summary_stat: median
     - class_path: hepattn.callbacks.MemoryStats
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint

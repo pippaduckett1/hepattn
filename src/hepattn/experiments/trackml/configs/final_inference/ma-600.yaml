@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK-v8-eta4-pt600-epochs30
+name: MA-600-inference
 data:
   # isambard
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -73,7 +73,7 @@ trainer:
   devices: 1
   precision: bf16-mixed
   log_every_n_steps: 50
-  default_root_dir: ./logs/
+  default_root_dir: /share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/logs/
   gradient_clip_val: 0.1
   enable_progress_bar: true
 
@@ -91,19 +91,21 @@ trainer:
       project: trackml_tracking
 
   callbacks:
-    # - class_path: hepattn.callbacks.AttnMaskLogger
-    #   init_args:
-    #     log_every_n_batches: 100
     - class_path: hepattn.callbacks.Compile
       init_args:
         skip_dynamic_cudagraphs: true
         #mode: max-autotune # use for fastest inference
     - class_path: hepattn.callbacks.InferenceTimer
       init_args:
-        repeats_per_batch: 20
-        warmup_repeats_per_batch: 0
+        repeats_per_batch: 30
+        warmup_repeats_per_batch: 15
         warmup_full_test_set_passes: 1
         summary_stat: median
+      # init_args:
+      #   repeats_per_batch: 20
+      #   warmup_repeats_per_batch: 15
+      #   warmup_full_test_set_passes: 1
+      #   summary_stat: median
     - class_path: hepattn.callbacks.MemoryStats
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint

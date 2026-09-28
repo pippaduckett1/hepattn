@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK-v8-eta4-pt600-epochs30
+name: TRK-v8-eta4-pt600-epochs10
 data:
   # isambard
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -10,7 +10,7 @@ data:
   hit_eval_val: /share/rcif2/pduckett/hepattn-dq/HF-pix-600MeV-eta4_20260214-T195401/epoch=070-val_loss=0.20153_val_eval.h5
   hit_eval_test: /share/rcif2/pduckett/hepattn-dq/HF-pix-600MeV-eta4_20260214-T195401/epoch=070-val_loss=0.20153_test_eval.h5
   hit_filter_threshold: 0.1
-  
+
   num_workers: 10
   num_train: -1
   num_test: -1
@@ -68,12 +68,12 @@ data:
 
 trainer:
   # Training stuff here
-  max_epochs: 30
+  max_epochs: 10
   accelerator: gpu
   devices: 1
   precision: bf16-mixed
   log_every_n_steps: 50
-  default_root_dir: ./logs/
+  default_root_dir: /share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/logs/
   gradient_clip_val: 0.1
   enable_progress_bar: true
 
@@ -101,7 +101,7 @@ trainer:
     - class_path: hepattn.callbacks.InferenceTimer
       init_args:
         repeats_per_batch: 20
-        warmup_repeats_per_batch: 0
+        warmup_repeats_per_batch: 15
         warmup_full_test_set_passes: 1
         summary_stat: median
     - class_path: hepattn.callbacks.MemoryStats

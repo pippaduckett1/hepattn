@@ -1,0 +1,14 @@
+num_train: 8543
+num_val: 100
+batch_size: null
+trainable_params: 4384385
+num_gpus: 1
+gpu_ids:
+- 0
+num_workers: 12
+torch_version: 2.9.1+cu128
+lightning_version: 2.5.2
+cuda_version: '12.8'
+hostname: a100-2.us-central1-a.c.hep-reco.internal
+out_dir: /home/samvanstroud/hepattn/src/hepattn/experiments/trackml/logs/HF-pix-600MeV-eta4_20260214-T195401
+log_url: https://www.comet.com/samvanstroud/trackml-filtering/333eb8af4a1849799e5389892278a941

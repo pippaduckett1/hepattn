@@ -1,5 +1,5 @@
 seed_everything: 42
-name: TRK-v8-eta4-pt600-epochs30
+name: TRK-v8-no-sort-log-mask
 data:
   # isambard
   train_dir:  /share/rcif2/pduckett/data/prepped/train/
@@ -68,12 +68,12 @@ data:
 
 trainer:
   # Training stuff here
-  max_epochs: 30
+  max_epochs: 10
   accelerator: gpu
-  devices: 1
+  devices: 2
   precision: bf16-mixed
   log_every_n_steps: 50
-  default_root_dir: ./logs/
+  default_root_dir: /share/rcif2/pduckett/hepattn-dq/src/hepattn/experiments/trackml/logs/
   gradient_clip_val: 0.1
   enable_progress_bar: true
 
@@ -91,20 +91,14 @@ trainer:
       project: trackml_tracking
 
   callbacks:
-    # - class_path: hepattn.callbacks.AttnMaskLogger
-    #   init_args:
-    #     log_every_n_batches: 100
     - class_path: hepattn.callbacks.Compile
       init_args:
         skip_dynamic_cudagraphs: true
         #mode: max-autotune # use for fastest inference
-    - class_path: hepattn.callbacks.InferenceTimer
+    - class_path: hepattn.callbacks.AttnMaskLogger
       init_args:
-        repeats_per_batch: 20
-        warmup_repeats_per_batch: 0
-        warmup_full_test_set_passes: 1
-        summary_stat: median
-    - class_path: hepattn.callbacks.MemoryStats
+        log_every_n_batches: 100
+    - class_path: hepattn.callbacks.InferenceTimer
     - class_path: hepattn.callbacks.SaveConfig
     - class_path: hepattn.callbacks.Checkpoint
       init_args:
@@ -141,6 +135,10 @@ model:
     init_args:
       dim: &dim 256
       input_sort_field: phi
+      # sorter:
+      #   class_path: hepattn.utils.sorter.Sorter
+      #   init_args:
+      #     input_sort_field: phi
       input_nets:
         class_path: torch.nn.ModuleList
         init_args:
@@ -202,8 +200,8 @@ model:
         num_queries: *num_objects
         mask_attention: true
         use_query_masks: false
-        debug: false
         unmask_all_false: true
+        debug: true
         decoder_layer_config:
           dim: *dim
           norm: CustomLayerNorm
@@ -222,7 +220,7 @@ model:
                 input_object: hit
                 classes: ["is_first"]
                 loss_weight: 1.0
-                threshold: 0.3
+                threshold: 0.1
                 permute_loss: false
                 net:
                   class_path: hepattn.models.Dense

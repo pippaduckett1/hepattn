@@ -120,14 +120,18 @@ core
 *.csv
 *.npy
 *.npz
+*.ckpt
+*.pkl
+*.lock
+*.cpp
+*.h
+*.gch
 
 # Log files
 src/hepattn/experiments/cld/plots/
 src/hepattn/experiments/cld/eval/
-src/hepattn/experiments/trackml/eval/
 
 *.sh
-*.yaml
 !src/hepattn/experiments/trackml/configs/filtering-lite-strip.yaml
 !src/hepattn/experiments/trackml/configs/queryPE-lite.yaml
 !src/hepattn/experiments/trackml/configs/tracking-eta4-nq-4000.yaml
